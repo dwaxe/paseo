@@ -65,6 +65,7 @@ export interface FakeCodexAppServer {
   updatesPlan(params: { threadId: string; steps: string[] }): void;
   completeTurn(params?: {
     threadId?: string;
+    turnId?: string;
     status?: "completed" | "failed" | "interrupted";
     error?: { message: string } | null;
   }): void;
@@ -200,6 +201,8 @@ export function createFakeCodexAppServer(
     ...handlers,
   };
   const messages: JsonObject[] = [];
+  const activeTurnIds = new Map<string, string>();
+  const foregroundThreadIds = new Set<string>();
   const errors: Error[] = [];
   const approvalRequestIds = new Map<string, number>();
   let mcpElicitationRequestId: number | undefined;
@@ -212,6 +215,13 @@ export function createFakeCodexAppServer(
 
   function processMessage(message: JsonObject): void {
     messages.push(message);
+    if (message.method === "turn/start") {
+      const threadId = toJsonObject(message.params).threadId;
+      if (typeof threadId === "string") {
+        foregroundThreadIds.add(threadId);
+        activeTurnIds.delete(threadId);
+      }
+    }
     for (const waiter of Array.from(waiters)) {
       if (waiter.predicate(message)) {
         waiters.delete(waiter);
@@ -359,12 +369,14 @@ export function createFakeCodexAppServer(
       });
     },
     startsTurn(params) {
+      const turnId = params.turnId ?? `turn-${params.threadId}`;
+      activeTurnIds.set(params.threadId, turnId);
       child.stdout.write(
         `${JSON.stringify({
           method: "turn/started",
           params: {
             threadId: params.threadId,
-            turn: { id: params.turnId ?? `turn-${params.threadId}` },
+            turn: { id: turnId },
           },
         })}\n`,
       );
@@ -387,12 +399,22 @@ export function createFakeCodexAppServer(
       );
     },
     completeTurn(params = {}) {
+      const threadId = params.threadId ?? "thread-1";
+      const turnId = params.turnId ?? activeTurnIds.get(threadId) ?? `turn-${threadId}`;
+      if (!params.turnId && !activeTurnIds.has(threadId) && foregroundThreadIds.has(threadId)) {
+        // Older fixtures completed a requested turn without emitting its native
+        // start. Keep both notifications realistic and explicitly correlated.
+        activeTurnIds.set(threadId, turnId);
+        writeNotification("turn/started", { threadId, turn: { id: turnId } });
+      }
+      if (activeTurnIds.get(threadId) === turnId) activeTurnIds.delete(threadId);
       child.stdout.write(
         `${JSON.stringify({
           method: "turn/completed",
           params: {
-            threadId: params.threadId ?? "thread-1",
+            threadId,
             turn: {
+              id: turnId,
               status: params.status ?? "completed",
               error: params.error ?? null,
             },

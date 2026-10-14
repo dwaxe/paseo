@@ -1793,6 +1793,8 @@ export class VoiceAssistantWebSocketServer {
         usageSources: true,
         ownedSubscriptions: true,
         agentRequestReceipts: true,
+        agentConditionalDelivery: true,
+        agentConditionalCancel: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,
         hubAgentRpc: true,

@@ -2,7 +2,7 @@ import type { Command } from "commander";
 import { connectToDaemon } from "../../utils/client.js";
 import { collectMultiple } from "../../utils/command-options.js";
 import type { CommandError, CommandOptions, SingleResult } from "../../output/index.js";
-import { agentRunSchema, type AgentRunResult } from "./run.js";
+import { agentRunSchema, toRunResult, type AgentRunResult } from "./run.js";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 
 export function addImportOptions(cmd: Command): Command {
@@ -29,13 +29,7 @@ export interface AgentImportOptions extends CommandOptions {
 export type AgentImportCommandResult = SingleResult<AgentRunResult>;
 
 function toImportResult(agent: AgentSnapshotPayload): AgentRunResult {
-  return {
-    agentId: agent.id,
-    status: agent.status === "running" ? "running" : "created",
-    provider: agent.provider,
-    cwd: agent.cwd,
-    title: agent.title,
-  };
+  return toRunResult(agent);
 }
 
 function parseImportProvider(provider: string | undefined): string {

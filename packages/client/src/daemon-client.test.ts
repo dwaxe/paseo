@@ -10,6 +10,12 @@ import {
   type Logger,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import type {
+  AgentSnapshotPayload,
+  AgentMessageSendIfCurrentExpected,
+  AgentMessageSendIfCurrentResult,
+  AgentRunCancelIfCurrentResult,
+} from "@getpaseo/protocol/messages";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
   decodeFileTransferFrame,
@@ -7111,6 +7117,96 @@ test("creation lifecycle sends the keyed agent and initial prompt as one intent"
   expect(transport.sent).toHaveLength(1);
 });
 
+test.each([
+  { modern: true, initialRunId: "initial-invocation" },
+  { modern: true, initialRunId: null },
+  { modern: true, initialRunId: undefined },
+  { modern: false, initialRunId: undefined },
+])(
+  "creation run proof stays separate from current native activity: %j",
+  async ({ modern, initialRunId }) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "creation-run-proof",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    transport.triggerOpen({ features: { creationLifecycle: modern } });
+    await connected;
+    const agent: AgentSnapshotPayload = {
+      id: "00000000-0000-4000-8000-000000000001",
+      provider: "codex",
+      cwd: "/project",
+      model: null,
+      createdAt: "2026-10-14T00:00:00Z",
+      updatedAt: "2026-10-14T00:00:00Z",
+      lastUserMessageAt: null,
+      status: "running",
+      activeRun: { runId: "successor-run", phase: "running", turnId: "native-B" },
+      latestRunId: "successor-run",
+      capabilities: {
+        supportsStreaming: true,
+        supportsSessionPersistence: true,
+        supportsDynamicModes: false,
+        supportsMcpServers: false,
+        supportsReasoningStream: false,
+        supportsToolInvocations: true,
+      },
+      currentModeId: null,
+      availableModes: [],
+      pendingPermissions: [],
+      persistence: null,
+      title: null,
+    };
+    const creating = client.createAgentWithRun({
+      provider: "codex",
+      cwd: "/project",
+      initialPrompt: "A",
+    });
+    const request = parseSentFrame(transport.sent[0]);
+    transport.triggerMessage(
+      wrapSessionMessage(
+        modern
+          ? {
+              type: "agent.create.response",
+              payload: {
+                requestId: request.requestId,
+                agent,
+                error: null,
+                creation: {
+                  kind: "agent",
+                  idempotencyKey: request.idempotencyKey,
+                  revision: 3,
+                  phase: "completed",
+                  workspaceId: null,
+                  agentId: agent.id,
+                  agent,
+                  error: null,
+                  ...(initialRunId === undefined ? {} : { initialRunId }),
+                },
+              },
+            }
+          : {
+              type: "status",
+              payload: {
+                status: "agent_created",
+                requestId: request.requestId,
+                agentId: agent.id,
+                agent,
+              },
+            },
+      ),
+    );
+    expect(await creating).toMatchObject({
+      agent: { activeRun: agent.activeRun, latestRunId: "successor-run" },
+      initialRunId: initialRunId ?? null,
+    });
+  },
+);
+
 test("creation lifecycle acknowledgement reaches the observer before the final response", async () => {
   const transport = createMockTransport();
   const client = new DaemonClient({
@@ -7576,6 +7672,282 @@ test("usage request timeout detaches its update listener", async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+test.each([{}, { agentConditionalDelivery: false }])(
+  "conditional message delivery rejects unsupported hosts without sending: %j",
+  async (features) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "conditional-delivery",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({ features });
+    await connecting;
+    await expect(
+      client.sendAgentMessageIfCurrent("550e8400-e29b-41d4-a716-446655440000", "review", {
+        messageId: "delivery",
+        expected: { kind: "idle" },
+      }),
+    ).rejects.toThrow("Update the Paseo host to use conditional message delivery.");
+    expect(transport.sent).toEqual([]);
+  },
+);
+
+test.each([{}, { agentConditionalCancel: false }, { agentConditionalDelivery: true }])(
+  "conditional run cancellation requires its own host capability: %j",
+  async (features) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "conditional-cancellation",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({ features });
+    await connecting;
+    await expect(
+      client.cancelAgentRunIfCurrent("550e8400-e29b-41d4-a716-446655440000", {
+        messageId: "cancel-operation",
+        expectedRunId: "run-A",
+      }),
+    ).rejects.toThrow("Update the Paseo host to use conditional run cancellation.");
+    expect(transport.sent).toEqual([]);
+  },
+);
+
+test.each<AgentRunCancelIfCurrentResult>([
+  { status: "cancelled", runId: "run-A" },
+  { status: "busy", currentRun: { runId: "run-A", phase: "starting", turnId: null } },
+  { status: "mismatch", currentRun: { runId: "run-B", phase: "running", turnId: "turn-B" } },
+  { status: "mismatch", currentRun: null },
+])(
+  "conditional run cancellation preserves the observed run and correlated proof: %j",
+  async (result) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "conditional-cancellation",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({ features: { agentConditionalCancel: true } });
+    await connecting;
+    const agentId = "550e8400-e29b-41d4-a716-446655440000";
+    const options = { messageId: "cancel-operation", expectedRunId: "run-A" };
+    const cancel = client.cancelAgentRunIfCurrent(agentId, options);
+    expectTypeOf(cancel).toEqualTypeOf<Promise<AgentRunCancelIfCurrentResult>>();
+    const request = parseSentFrame(transport.sent[0]);
+    expect(request).toEqual({
+      type: "agent.run.cancel_if_current.request",
+      requestId: expect.any(String),
+      agentId,
+      ...options,
+    });
+    const payload = { requestId: request.requestId, agentId, result, error: null };
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.run.cancel_if_current.response",
+        payload: { ...payload, requestId: "another-request", result: null, error: "unrelated" },
+      }),
+    );
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.run.cancel_if_current.response",
+        payload: { ...payload, agentId: "another-agent", result: null, error: "wrong target" },
+      }),
+    );
+    transport.triggerMessage(
+      wrapSessionMessage({ type: "agent.run.cancel_if_current.response", payload }),
+    );
+    await expect(cancel).resolves.toEqual(result);
+    expect(transport.sent).toHaveLength(1);
+  },
+);
+
+test.each([
+  { error: "agent_request_outcome_unknown", expectedError: "agent_request_outcome_unknown" },
+  { error: null, expectedError: "Conditional run cancellation returned no result." },
+])("conditional run cancellation rejects errors without a legacy retry: %j", async (testCase) => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "conditional-cancellation",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen({ features: { agentConditionalCancel: true } });
+  await connecting;
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const cancel = client.cancelAgentRunIfCurrent(agentId, {
+    messageId: "cancel-operation",
+    expectedRunId: "run-A",
+  });
+  const rejected = expect(cancel).rejects.toThrow(testCase.expectedError);
+  const request = parseSentFrame(transport.sent[0]);
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.run.cancel_if_current.response",
+      payload: { requestId: request.requestId, agentId, result: null, error: testCase.error },
+    }),
+  );
+  await rejected;
+  expect(transport.sent).toHaveLength(1);
+});
+
+interface ConditionalDeliveryCase {
+  expected: AgentMessageSendIfCurrentExpected;
+  result: AgentMessageSendIfCurrentResult;
+}
+
+test.each<ConditionalDeliveryCase>([
+  { expected: { kind: "idle" }, result: { status: "accepted", runId: "run-new", turnId: null } },
+  {
+    expected: { kind: "run", runId: "run-A" },
+    result: { status: "accepted", runId: "run-new", turnId: "turn-new" },
+  },
+  {
+    expected: { kind: "idle" },
+    result: { status: "busy", currentRun: { runId: "run-A", phase: "starting", turnId: null } },
+  },
+  {
+    expected: { kind: "run", runId: "run-A" },
+    result: {
+      status: "mismatch",
+      currentRun: { runId: "run-B", phase: "running", turnId: "turn-B" },
+    },
+  },
+  { expected: { kind: "run", runId: "run-A" }, result: { status: "mismatch", currentRun: null } },
+])(
+  "conditional message delivery preserves the observed expectation and result: %j",
+  async (testCase) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "conditional-delivery",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({ features: { agentConditionalDelivery: true } });
+    await connecting;
+    expect(client.getLastServerInfoMessage()?.features?.agentConditionalDelivery).toBe(true);
+    const agentId = "550e8400-e29b-41d4-a716-446655440000";
+    const options = {
+      messageId: "delivery",
+      expected: testCase.expected,
+      images: [{ data: "aGVsbG8=", mimeType: "image/png" }],
+      attachments: [
+        {
+          type: "github_pr" as const,
+          mimeType: "application/github-pr" as const,
+          number: 123,
+          title: "Review this PR",
+          url: "https://github.com/getpaseo/paseo/pull/123",
+        },
+      ],
+    };
+    const send = client.sendAgentMessageIfCurrent(agentId, "review", options);
+    expectTypeOf(send).toEqualTypeOf<Promise<AgentMessageSendIfCurrentResult>>();
+    const request = parseSentFrame(transport.sent[0]);
+    expect(request).toEqual({
+      type: "agent.message.send_if_current.request",
+      requestId: expect.any(String),
+      agentId,
+      text: "review",
+      ...options,
+    });
+    const payload = { requestId: request.requestId, agentId, result: testCase.result, error: null };
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.message.send_if_current.response",
+        payload: { ...payload, requestId: "another-request", result: null, error: "unrelated" },
+      }),
+    );
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.message.send_if_current.response",
+        payload: { ...payload, agentId: "another-agent", result: null, error: "wrong target" },
+      }),
+    );
+    transport.triggerMessage(
+      wrapSessionMessage({ type: "agent.message.send_if_current.response", payload }),
+    );
+    await expect(send).resolves.toEqual(testCase.result);
+    expect(transport.sent).toHaveLength(1);
+  },
+);
+
+test.each([
+  { error: "agent_request_outcome_unknown", expectedError: "agent_request_outcome_unknown" },
+  { error: null, expectedError: "Conditional message delivery returned no result." },
+])("conditional message delivery propagates errors without retrying: %j", async (testCase) => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "conditional-delivery",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen({ features: { agentConditionalDelivery: true } });
+  await connecting;
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const send = client.sendAgentMessageIfCurrent(agentId, "review", {
+    messageId: "delivery",
+    expected: { kind: "run", runId: "run-A" },
+  });
+  const rejected = expect(send).rejects.toThrow(testCase.expectedError);
+  const request = parseSentFrame(transport.sent[0]);
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.message.send_if_current.response",
+      payload: { requestId: request.requestId, agentId, result: null, error: testCase.error },
+    }),
+  );
+  await rejected;
+  expect(transport.sent).toHaveLength(1);
+});
+
+test("conditional message delivery refreshes its capability and does not replay after reconnect", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "conditional-delivery",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen({ features: { agentConditionalDelivery: true } });
+  await connecting;
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const options = { messageId: "delivery", expected: { kind: "idle" as const } };
+  const send = client.sendAgentMessageIfCurrent(agentId, "review", options);
+  const rejected = expect(send).rejects.toThrow();
+  expect(transport.sent).toHaveLength(1);
+  transport.triggerClose({ code: 1006, reason: "Connection lost after dispatch" });
+  await rejected;
+  const reconnecting = client.connect();
+  transport.triggerOpen({ features: {} });
+  await reconnecting;
+  expect(transport.sent).toEqual([]);
+  await expect(client.sendAgentMessageIfCurrent(agentId, "review", options)).rejects.toThrow(
+    "Update the Paseo host to use conditional message delivery.",
+  );
+  expect(transport.sent).toEqual([]);
 });
 
 test.each([false, true])(

@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
+import { AgentSnapshotPayloadSchema } from "@getpaseo/protocol/messages";
+import { renderJson } from "../../output/json.js";
 import { resolveCallerAgentId as resolveRunCallerAgentId } from "../../utils/caller-agent.js";
 import {
   resolveExistingRunWorkspace,
   runRunCommand,
+  toRunResult,
+  agentRunSchema,
+  finishCreatedAgentRun,
   waitsForFinish,
   type AgentRunOptions,
 } from "./run";
@@ -28,6 +33,125 @@ describe("run wait policy", () => {
     expect(waitsForFinish({ wait: false })).toBe(false);
     expect(waitsForFinish({ background: true })).toBe(false);
     expect(waitsForFinish({ detach: true })).toBe(false);
+  });
+});
+
+describe("run invocation receipts", () => {
+  const snapshot = AgentSnapshotPayloadSchema.parse({
+    id: "created-agent",
+    provider: "codex",
+    cwd: "/workspace",
+    model: null,
+    createdAt: "2026-10-14T00:00:00.000Z",
+    updatedAt: "2026-10-14T00:00:00.000Z",
+    lastUserMessageAt: null,
+    status: "idle",
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: false,
+      supportsMcpServers: false,
+      supportsReasoningStream: false,
+      supportsToolInvocations: false,
+    },
+    currentModeId: null,
+    availableModes: [],
+    pendingPermissions: [],
+    persistence: null,
+    title: null,
+  });
+
+  it("includes a starting run's identity in JSON output", () => {
+    const data = toRunResult(
+      {
+        ...snapshot,
+        activeRun: { runId: "initial-run", phase: "starting", turnId: null },
+      },
+      undefined,
+      "initial-run",
+    );
+    expect(
+      JSON.parse(renderJson({ type: "single", data, schema: agentRunSchema }, { format: "json" })),
+    ).toMatchObject({ agentId: "created-agent", runId: "initial-run" });
+  });
+
+  it("retains a completed creation run when its active run has cleared", () => {
+    expect(
+      toRunResult(
+        { ...snapshot, activeRun: null, latestRunId: "initial-run" },
+        undefined,
+        "initial-run",
+      ).runId,
+    ).toBe("initial-run");
+  });
+
+  it("keeps the creation run's identity when a successor starts before foreground wait finishes", () => {
+    expect(
+      toRunResult(
+        {
+          ...snapshot,
+          activeRun: { runId: "successor-run", phase: "running", turnId: "successor-turn" },
+          latestRunId: "successor-run",
+        },
+        "completed",
+        "initial-run",
+      ).runId,
+    ).toBe("initial-run");
+    expect(
+      toRunResult({ ...snapshot, latestRunId: "successor-run" }, "completed", null).runId,
+    ).toBeNull();
+  });
+
+  it.each([
+    { wait: true, initialRunId: "initial-run" },
+    { wait: false, initialRunId: "initial-run" },
+    { wait: true, initialRunId: null },
+    { wait: false, initialRunId: null },
+  ])("keeps exact or unavailable creation proof in JSON: %j", async ({ wait, initialRunId }) => {
+    const successor = {
+      ...snapshot,
+      status: "running" as const,
+      activeRun: { runId: "successor-run", phase: "running" as const, turnId: "native-B" },
+      latestRunId: "successor-run",
+    };
+    const waits: Array<{ agentId: string; timeoutMs?: number }> = [];
+    let closed = false;
+    const result = await finishCreatedAgentRun({
+      client: {
+        async waitForFinish(agentId, timeoutMs) {
+          waits.push({ agentId, timeoutMs });
+          return {
+            status: "idle",
+            final: { ...successor, status: "idle", activeRun: null },
+            error: null,
+            lastMessage: null,
+          };
+        },
+        async close() {
+          closed = true;
+        },
+      },
+      creation: { agent: successor, initialRunId },
+      wait,
+      waitTimeoutMs: 1234,
+    });
+    expect(JSON.parse(renderJson(result, { format: "json" }))).toMatchObject({
+      agentId: snapshot.id,
+      runId: initialRunId,
+      status: wait ? "completed" : "running",
+    });
+    expect(waits).toEqual(wait ? [{ agentId: snapshot.id, timeoutMs: 1234 }] : []);
+    expect(closed).toBe(true);
+  });
+
+  it("does not infer a creation invocation from a current or latest run", () => {
+    expect(
+      toRunResult({
+        ...snapshot,
+        activeRun: { runId: "successor-run", phase: "running", turnId: "native-B" },
+        latestRunId: "successor-run",
+      }).runId,
+    ).toBeNull();
   });
 });
 

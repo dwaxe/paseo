@@ -211,6 +211,7 @@ function buildRunOutput(params: {
 type ScheduleAgentManager = Pick<
   AgentRunController,
   | "getAgent"
+  | "waitForConditionalDelivery"
   | "reloadAgentSession"
   | "tryRunOutOfBand"
   | "hasInFlightRun"

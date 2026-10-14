@@ -6,7 +6,11 @@ import type {
   AgentPromptInput,
   AgentRunOptions,
 } from "./agent-sdk-types.js";
-import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+import {
+  AgentTurnAdmissionReservedError,
+  type AgentManager,
+  type ManagedAgent,
+} from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
@@ -18,6 +22,7 @@ export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "
 export type AgentRunController = Pick<
   AgentManager,
   | "getAgent"
+  | "waitForConditionalDelivery"
   | "tryRunOutOfBand"
   | "hasInFlightRun"
   | "replaceAgentRun"
@@ -93,6 +98,25 @@ async function drainAgentRunIterator(
 }
 
 export async function startAgentRun(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  logger: Logger,
+  options?: StartAgentRunOptions,
+): Promise<{ disposition: PromptDispatchDisposition }> {
+  while (true) {
+    await agentManager.waitForConditionalDelivery(agentId);
+    try {
+      return await startAgentRunAfterAdmissionWait(agentManager, agentId, prompt, logger, options);
+    } catch (error) {
+      if (!(error instanceof AgentTurnAdmissionReservedError)) throw error;
+      // The synchronous guard proves no provider effect happened. Wait for the
+      // reservation that won admission, then retry this ordinary human request.
+    }
+  }
+}
+
+async function startAgentRunAfterAdmissionWait(
   agentManager: AgentRunController,
   agentId: string,
   prompt: AgentPromptInput,
@@ -244,6 +268,7 @@ export interface StartCreatedAgentInitialPromptParams {
   prompt: AgentPromptInput | null;
   source?: AgentPromptSource;
   runOptions?: AgentRunOptions;
+  onRunAdmitted?: (runId: string) => void;
   logger: Logger;
 }
 
@@ -382,7 +407,13 @@ export async function startCreatedAgentInitialPrompt(
     params.agentId,
     delivery.prompt,
     params.logger,
-    { runOptions: { ...params.runOptions, clientMessageId: delivery.messageId } },
+    {
+      runOptions: {
+        ...params.runOptions,
+        clientMessageId: delivery.messageId,
+        onRunAdmitted: params.onRunAdmitted,
+      },
+    },
   );
 
   if (dispatchResult.disposition === "turn_started") {

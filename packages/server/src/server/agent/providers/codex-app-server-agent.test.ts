@@ -16,6 +16,11 @@ import type {
   AgentSlashCommand,
   AgentStreamEvent,
 } from "../agent-sdk-types.js";
+import { AgentManager } from "../agent-manager.js";
+import { AgentStorage } from "../agent-storage.js";
+import { createAgentCommand } from "../create-agent/create.js";
+import { toAgentPayload } from "../agent-projections.js";
+import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import {
   buildCodexAppServerEnv,
   CodexAppServerAgentClient,
@@ -127,6 +132,7 @@ interface CodexClientLike {
 type CodexTestSession = AgentSession & {
   connectionState: "disconnected" | "history-ready" | "connected";
   currentThreadId: string | null;
+  currentTurnId: string | null;
   activeForegroundTurnId: string | null;
   client: CodexClientLike | null;
 };
@@ -168,8 +174,16 @@ function createSession(
   ) as CodexTestSession;
   session.connectionState = "connected";
   session.currentThreadId = "test-thread";
+  session.currentTurnId = "test-turn";
   session.activeForegroundTurnId = "test-turn";
   return session;
+}
+
+function completeTestTurn(session: CodexTestSession): void {
+  asInternals(session).handleNotification("turn/completed", {
+    threadId: session.currentThreadId,
+    turn: { id: session.currentTurnId, status: "completed", error: null },
+  });
 }
 
 function createProviderWithFakeAppServer(
@@ -221,6 +235,1144 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+function waitForCodexTurnEvent(
+  session: AgentSession,
+  type: "turn_started" | "turn_completed",
+): Promise<AgentStreamEvent> {
+  return new Promise((resolve) => {
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type !== type) return;
+      unsubscribe();
+      resolve(event);
+    });
+  });
+}
+
+describe("Codex conditional interruption", () => {
+  test.each(["cancel", "replace"])(
+    "conditional %s targets an observed autonomous run's native identity",
+    async (operation) => {
+      const workdir = await mkdtemp(path.join(tmpdir(), "codex-conditional-autonomous-"));
+      const appServer = createFakeCodexAppServer({
+        "turn/interrupt": () => {
+          appServer.completeTurn({ status: "interrupted" });
+          return {};
+        },
+      });
+      const manager = new AgentManager({
+        clients: { codex: createProviderWithFakeAppServer(appServer) },
+        logger: createTestLogger(),
+      });
+      const agent = await manager.createAgent(createConfig({ cwd: workdir }), undefined, {
+        workspaceId: undefined,
+      });
+      try {
+        const autonomousStarted = new Promise<void>((resolve) => {
+          const unsubscribe = manager.subscribe(
+            (event) => {
+              if (event.type !== "agent_state" || !event.agent.activeRun) return;
+              unsubscribe();
+              resolve();
+            },
+            { agentId: agent.id, replayState: false },
+          );
+        });
+        appServer.startsTurn({ threadId: "thread-1", turnId: "native-autonomous-A" });
+        await autonomousStarted;
+        const original = manager.getAgent(agent.id)!.activeRun!;
+        expect(original).toMatchObject({ phase: "running", turnId: "native-autonomous-A" });
+        const result =
+          operation === "cancel"
+            ? await manager.cancelAgentRunIfCurrent({
+                agentId: agent.id,
+                expectedRunId: original.runId,
+              })
+            : await manager.sendAgentMessageIfCurrent({
+                agentId: agent.id,
+                prompt: "replacement",
+                expected: { kind: "run", runId: original.runId },
+                clientMessageId: "autonomous-replacement",
+              });
+        expect(result.status).toBe(operation === "cancel" ? "cancelled" : "accepted");
+        expect(
+          appServer
+            .requests()
+            .filter((request) => request.method === "turn/interrupt")
+            .map((request) => request.params),
+        ).toEqual([{ threadId: "thread-1", turnId: "native-autonomous-A" }]);
+        if (operation === "cancel") expect(manager.getAgent(agent.id)!.activeRun).toBeNull();
+        appServer.assertNoErrors();
+      } finally {
+        await manager.closeAgent(agent.id);
+        rmSync(workdir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("conditional interrupt times out withheld native identification without interrupting its late notification", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: "native-A" } }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+      { turnIdentificationTimeoutMs: 0 },
+    );
+
+    try {
+      const started = await session.startTurn("first");
+      await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+        status: "busy",
+      });
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+
+      const identified = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      await identified;
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+
+      await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(
+        appServer
+          .requests()
+          .filter((request) => request.method === "turn/interrupt")
+          .map((request) => request.params),
+      ).toEqual([{ threadId: "thread-1", turnId: "native-A" }]);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("conditional interrupt rejects a different observed foreground identity without a native request", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: "native-A" } }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      const started = await session.startTurn("first");
+      const identified = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      await identified;
+
+      await expect(session.interruptExpectedTurn("a-different-foreground-turn")).resolves.toEqual({
+        status: "mismatch",
+      });
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+      await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(await appServer.waitForRequest("turn/interrupt")).toEqual({
+        threadId: "thread-1",
+        turnId: "native-A",
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("conditional interrupt waits for its observed foreground turn and targets the frozen native identity", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: "native-identified-A" } }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      const started = await session.startTurn("first");
+      const interrupt = session.interruptExpectedTurn(started.turnId);
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-identified-A" });
+
+      await expect(interrupt).resolves.toEqual({ status: "interrupted" });
+      expect(await appServer.waitForRequest("turn/interrupt")).toEqual({
+        threadId: "thread-1",
+        turnId: "native-identified-A",
+      });
+      expect(started.turnId).not.toBe("native-identified-A");
+      expect(
+        appServer.requests().filter((request) => request.method === "turn/interrupt"),
+      ).toHaveLength(1);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+});
+
+describe("Codex conditional interruption races", () => {
+  test("conditional interrupt preserves a successor when an old already-idle reply arrives", async () => {
+    const interruptReply = deferred<{
+      __jsonRpcError: { code: number; message: string };
+    }>();
+    const nativeTurnIds = ["native-A", "native-B"];
+    let nextNativeTurn = 0;
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => {
+        const id = nativeTurnIds[nextNativeTurn++];
+        return { turn: { id } };
+      },
+      "turn/interrupt": () => interruptReply.promise,
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      const startedA = await session.startTurn("first");
+      const identifiedA = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      await identifiedA;
+      const interruptA = session.interruptExpectedTurn(startedA.turnId);
+      expect(await appServer.waitForRequest("turn/interrupt")).toEqual({
+        threadId: "thread-1",
+        turnId: "native-A",
+      });
+
+      const completedA = waitForCodexTurnEvent(session, "turn_completed");
+      appServer.completeTurn();
+      await completedA;
+      const startedB = await session.startTurn("second", { clientMessageId: "message-B" });
+      const identifiedB = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+      await identifiedB;
+      interruptReply.resolve({
+        __jsonRpcError: { code: -32600, message: "no active turn to interrupt" },
+      });
+
+      await expect(interruptA).resolves.toEqual({ status: "interrupted" });
+      await expect(session.interruptExpectedTurn(startedB.turnId)).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(
+        appServer
+          .requests()
+          .filter((request) => request.method === "turn/interrupt")
+          .map((request) => request.params),
+      ).toEqual([
+        { threadId: "thread-1", turnId: "native-A" },
+        { threadId: "thread-1", turnId: "native-B" },
+      ]);
+      appServer.assertNoErrors();
+    } finally {
+      interruptReply.resolve({
+        __jsonRpcError: { code: -32600, message: "no active turn to interrupt" },
+      });
+      await session.close();
+    }
+  });
+
+  test("conditional interrupt never cancels a successor after pending native identification changes", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: "native-A" } }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      const startedA = await session.startTurn("first");
+      const interruptA = session.interruptExpectedTurn(startedA.turnId);
+      const successorStarted = deferred<void>();
+      const unsubscribe = session.subscribe((event) => {
+        if (event.type !== "turn_started" || event.turnId !== "native-B") return;
+        unsubscribe();
+        successorStarted.resolve();
+      });
+
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      appServer.completeTurn();
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+      await successorStarted.promise;
+
+      await expect(interruptA).resolves.toEqual({ status: "mismatch" });
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+      await expect(session.interruptExpectedTurn("native-B")).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(await appServer.waitForRequest("turn/interrupt")).toEqual({
+        threadId: "thread-1",
+        turnId: "native-B",
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([{}, { turn: { id: "another-native-turn" } }])(
+    "conditional interrupt rejects an uncorroborated native mapping: %j",
+    async (turnStartReply) => {
+      const appServer = createFakeCodexAppServer({
+        "turn/start": () => turnStartReply,
+        "turn/interrupt": () => ({}),
+      });
+      const session = new CodexAppServerAgentSession(
+        createConfig({ cwd: "/workspace/project" }),
+        null,
+        createTestLogger(),
+        async () => appServer.child,
+      );
+
+      try {
+        const started = await session.startTurn("first");
+        const identified = waitForCodexTurnEvent(session, "turn_started");
+        appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+        await identified;
+
+        await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+          status: "mismatch",
+        });
+        expect(
+          appServer.requests().filter((request) => request.method === "turn/interrupt"),
+        ).toEqual([]);
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+});
+
+describe("Codex native terminal ownership", () => {
+  test("creation proof retains its admitted invocation when a native successor starts before the response", async () => {
+    const workdir = await mkdtemp(path.join(tmpdir(), "codex-create-run-proof-"));
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: "native-A" } }),
+      "turn/interrupt": () => {
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-B", status: "interrupted" });
+        return {};
+      },
+    });
+    const originalStarted = deferred<void>();
+    const allowCreateResponse = deferred<void>();
+    const storage = new AgentStorage(path.join(workdir, "agents"), createTestLogger());
+    class HeldCreationManager extends AgentManager {
+      override async waitForAgentRunStart(
+        ...args: Parameters<AgentManager["waitForAgentRunStart"]>
+      ) {
+        await super.waitForAgentRunStart(...args);
+        originalStarted.resolve();
+        await allowCreateResponse.promise;
+      }
+    }
+    const manager = new HeldCreationManager({
+      clients: { codex: createProviderWithFakeAppServer(appServer) },
+      registry: storage,
+      logger: createTestLogger(),
+    });
+    let agentId: string | undefined;
+    try {
+      const created = createAgentCommand(
+        {
+          agentManager: manager,
+          agentStorage: storage,
+          logger: createTestLogger(),
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        },
+        {
+          kind: "session",
+          config: createConfig({ cwd: workdir, modeId: "full-access" }),
+          workspaceId: "creation-proof-workspace",
+          initialPrompt: "A",
+          clientMessageId: "creation-message-A",
+          labels: {},
+          provisionalTitle: null,
+          firstAgentContext: { prompt: "A" },
+          buildSessionConfig: async (config) => ({ sessionConfig: config }),
+          onAgentReady: async (agent) => {
+            agentId = agent.id;
+          },
+        },
+      );
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      await originalStarted.promise;
+      const originalRunId = manager.getAgent(agentId!)!.activeRun!.runId;
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-A" });
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+      await expect.poll(() => manager.getAgent(agentId!)!.activeRun?.turnId).toBe("native-B");
+      const successor = manager.getAgent(agentId!)!.activeRun!;
+      allowCreateResponse.resolve();
+      const result = await created;
+      const response = toAgentPayload(result.liveSnapshot);
+      expect(result.initialRunId).toBe(originalRunId);
+      expect(response.activeRun).toEqual(successor);
+      expect(response.latestRunId).toBe(successor.runId);
+      expect(successor.runId).not.toBe(originalRunId);
+      expect(
+        await manager.cancelAgentRunIfCurrent({
+          agentId: agentId!,
+          expectedRunId: result.initialRunId!,
+        }),
+      ).toEqual({ status: "mismatch", currentRun: successor });
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+      expect(
+        await manager.cancelAgentRunIfCurrent({
+          agentId: agentId!,
+          expectedRunId: successor.runId,
+        }),
+      ).toEqual({ status: "cancelled", runId: successor.runId });
+      expect(
+        appServer
+          .requests()
+          .filter((request) => request.method === "turn/interrupt")
+          .map((request) => request.params),
+      ).toEqual([{ threadId: "thread-1", turnId: "native-B" }]);
+      appServer.assertNoErrors();
+    } finally {
+      allowCreateResponse.resolve();
+      if (agentId) await manager.closeAgent(agentId);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["completed", "failed", "interrupted"] as const)(
+    "a delayed %s for A preserves B after ordinary cancellation rescue",
+    async (status) => {
+      const workdir = await mkdtemp(path.join(tmpdir(), "codex-delayed-native-terminal-"));
+      let ordinal = 0;
+      const appServer = createFakeCodexAppServer({
+        "turn/start": () => ({ turn: { id: ["native-A", "native-B"][ordinal++] } }),
+        "turn/interrupt": () => ({
+          __jsonRpcError: { code: -32600, message: "no active turn to interrupt" },
+        }),
+      });
+      const manager = new AgentManager({
+        clients: { codex: createProviderWithFakeAppServer(appServer) },
+        logger: createTestLogger(),
+      });
+      const agent = await manager.createAgent(createConfig({ cwd: workdir }), undefined, {
+        workspaceId: undefined,
+      });
+      try {
+        const first = await manager.sendAgentMessageIfCurrent({
+          agentId: agent.id,
+          prompt: "A",
+          expected: { kind: "idle" },
+          clientMessageId: "message-A",
+        });
+        expect(first.status).toBe("accepted");
+        await manager.waitForAgentRunStart(agent.id);
+        const session = manager.getAgent(agent.id)!.session!;
+        const startedA = waitForCodexTurnEvent(session, "turn_started");
+        appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+        await startedA;
+        expect(await manager.cancelAgentRun(agent.id)).toEqual({ status: "settled" });
+        const second = await manager.sendAgentMessageIfCurrent({
+          agentId: agent.id,
+          prompt: "B",
+          expected: { kind: "idle" },
+          clientMessageId: "message-B",
+        });
+        expect(second.status).toBe("accepted");
+        await manager.waitForAgentRunStart(agent.id);
+        const startedB = waitForCodexTurnEvent(session, "turn_started");
+        appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+        await startedB;
+        await manager.flush();
+        const successor = manager.getAgent(agent.id)!.activeRun!;
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-A", status });
+        await manager.flush();
+        expect(manager.getAgent(agent.id)!.activeRun).toEqual(successor);
+        expect(
+          await manager.sendAgentMessageIfCurrent({
+            agentId: agent.id,
+            prompt: "C",
+            expected: { kind: "idle" },
+            clientMessageId: "message-C",
+          }),
+        ).toEqual({ status: "busy", currentRun: successor });
+        expect(
+          appServer.requests().filter((request) => request.method === "turn/start"),
+        ).toHaveLength(2);
+        expect(
+          appServer
+            .requests()
+            .filter((request) => request.method === "turn/interrupt")
+            .map((request) => request.params),
+        ).toEqual([{ threadId: "thread-1", turnId: "native-A" }]);
+        const completedB = waitForCodexTurnEvent(session, "turn_completed");
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-B" });
+        await completedB;
+        await manager.flush();
+        expect(manager.getAgent(agent.id)!.activeRun).toBeNull();
+        appServer.assertNoErrors();
+      } finally {
+        await manager.closeAgent(agent.id);
+        rmSync(workdir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["completed", "failed", "interrupted"] as const)(
+    "a matching %s before the start response settles its invocation after native binding",
+    async (status) => {
+      const response = deferred<{ turn: { id: string } }>();
+      const appServer = createFakeCodexAppServer({ "turn/start": () => response.promise });
+      const session = new CodexAppServerAgentSession(
+        createConfig({ cwd: "/workspace/project" }),
+        null,
+        createTestLogger(),
+        async () => appServer.child,
+      );
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      try {
+        const starting = session.startTurn("fast turn");
+        await appServer.waitForTurnStart();
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-fast", status });
+        expect(
+          events.filter((event) =>
+            ["turn_completed", "turn_failed", "turn_canceled"].includes(event.type),
+          ),
+        ).toEqual([]);
+        response.resolve({ turn: { id: "native-fast" } });
+        const started = await starting;
+        const expectedType = {
+          completed: "turn_completed",
+          failed: "turn_failed",
+          interrupted: "turn_canceled",
+        }[status];
+        expect(events.filter((event) => event.type === expectedType)).toEqual([
+          expect.objectContaining({ type: expectedType, turnId: started.turnId }),
+        ]);
+        await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+          status: "mismatch",
+        });
+      } finally {
+        response.resolve({ turn: { id: "native-fast" } });
+        await session.close();
+      }
+    },
+  );
+
+  test("an early current terminal settles its pending manager invocation after native binding", async () => {
+    const workdir = await mkdtemp(path.join(tmpdir(), "codex-early-native-terminal-"));
+    const response = deferred<{ turn: { id: string } }>();
+    const appServer = createFakeCodexAppServer({ "turn/start": () => response.promise });
+    const manager = new AgentManager({
+      clients: { codex: createProviderWithFakeAppServer(appServer) },
+      logger: createTestLogger(),
+    });
+    const agent = await manager.createAgent(createConfig({ cwd: workdir }), undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      const accepted = await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "fast turn",
+        expected: { kind: "idle" },
+        clientMessageId: "fast-message",
+      });
+      if (accepted.status !== "accepted") throw new Error("Expected accepted invocation");
+      await appServer.waitForTurnStart();
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-fast" });
+      await manager.flush();
+      expect(manager.getAgent(agent.id)!.activeRun).toEqual({
+        runId: accepted.runId,
+        phase: "starting",
+        turnId: null,
+      });
+      response.resolve({ turn: { id: "native-fast" } });
+      await expect.poll(() => manager.getAgent(agent.id)!.activeRun).toBeNull();
+      expect(manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "idle",
+        latestRunId: accepted.runId,
+      });
+      appServer.assertNoErrors();
+    } finally {
+      response.resolve({ turn: { id: "native-fast" } });
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    "complete_before_response",
+    "complete_after_burst",
+    "complete_after_response",
+    "cancel_running",
+    "failed_response",
+    "timed_out_response",
+  ])("an early foreground completion preserves its autonomous successor: %s", async (scenario) => {
+    const workdir = await mkdtemp(path.join(tmpdir(), "codex-early-autonomous-successor-"));
+    const response = deferred<unknown>();
+    let ordinal = 0;
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => (ordinal++ === 0 ? response.promise : { turn: { id: "native-C" } }),
+      "turn/interrupt": () => {
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-B", status: "interrupted" });
+        return {};
+      },
+    });
+    const manager = new AgentManager({
+      clients: { codex: createProviderWithFakeAppServer(appServer) },
+      logger: createTestLogger(),
+    });
+    const agent = await manager.createAgent(createConfig({ cwd: workdir }), undefined, {
+      workspaceId: undefined,
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream") events.push(event.event);
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    try {
+      if (scenario === "timed_out_response") vi.useFakeTimers();
+      const first = await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "A",
+        expected: { kind: "idle" },
+        clientMessageId: "message-A",
+      });
+      if (first.status !== "accepted") throw new Error("Expected accepted foreground invocation");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-A" });
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+      if (scenario === "complete_after_burst") {
+        for (let i = 0; i < 200; i++) {
+          appServer.child.stdout.write(
+            JSON.stringify({
+              method: "item/agentMessage/delta",
+              params: { threadId: "thread-1", itemId: "noise-B", delta: "b" },
+            }) + "\n",
+          );
+        }
+      }
+      appServer.child.stdout.write(
+        JSON.stringify({
+          method: "item/completed",
+          params: {
+            threadId: "thread-1",
+            item: { id: "message-B", type: "agentMessage", text: "Autonomous B" },
+          },
+        }) + "\n",
+      );
+      if (scenario === "complete_before_response" || scenario === "complete_after_burst") {
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-B" });
+      }
+      if (scenario === "timed_out_response") {
+        await vi.advanceTimersByTimeAsync(90_000);
+        vi.useRealTimers();
+      } else {
+        response.resolve(
+          scenario === "failed_response"
+            ? { __jsonRpcError: { code: -32603, message: "start response failed" } }
+            : { turn: { id: "native-A" } },
+        );
+      }
+
+      if (scenario === "complete_before_response" || scenario === "complete_after_burst") {
+        await expect.poll(() => manager.getAgent(agent.id)!.activeRun).toBeNull();
+      } else {
+        await expect.poll(() => manager.getAgent(agent.id)!.activeRun?.turnId).toBe("native-B");
+        const successor = manager.getAgent(agent.id)!.activeRun!;
+        expect(successor.runId).not.toBe(first.runId);
+        expect(
+          await manager.sendAgentMessageIfCurrent({
+            agentId: agent.id,
+            prompt: "C",
+            expected: { kind: "idle" },
+            clientMessageId: "busy-message-C",
+          }),
+        ).toEqual({ status: "busy", currentRun: successor });
+        expect(
+          await manager.cancelAgentRunIfCurrent({ agentId: agent.id, expectedRunId: first.runId }),
+        ).toEqual({ status: "mismatch", currentRun: successor });
+        if (scenario === "cancel_running") {
+          expect(
+            await manager.cancelAgentRunIfCurrent({
+              agentId: agent.id,
+              expectedRunId: successor.runId,
+            }),
+          ).toEqual({ status: "cancelled", runId: successor.runId });
+          expect(
+            appServer
+              .requests()
+              .filter((request) => request.method === "turn/interrupt")
+              .map((request) => request.params),
+          ).toEqual([{ threadId: "thread-1", turnId: "native-B" }]);
+        } else {
+          appServer.completeTurn({ threadId: "thread-1", turnId: "native-B" });
+          await expect.poll(() => manager.getAgent(agent.id)!.activeRun).toBeNull();
+        }
+      }
+      await manager.flush();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          turnId: "native-B",
+          item: expect.objectContaining({ type: "assistant_message", text: "Autonomous B" }),
+        }),
+      );
+      if (scenario !== "failed_response" && scenario !== "timed_out_response") {
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_completed", turnId: "codex-turn-0" }),
+        );
+      }
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "turn_started", turnId: "native-B" }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: scenario === "cancel_running" ? "turn_canceled" : "turn_completed",
+          turnId: "native-B",
+        }),
+      );
+      expect(manager.getAgent(agent.id)!.latestRunId).not.toBe(first.runId);
+      expect(
+        await manager.sendAgentMessageIfCurrent({
+          agentId: agent.id,
+          prompt: "C",
+          expected: { kind: "idle" },
+          clientMessageId: "accepted-message-C",
+        }),
+      ).toMatchObject({ status: "accepted" });
+      appServer.assertNoErrors();
+    } finally {
+      if (scenario === "timed_out_response") vi.useRealTimers();
+      unsubscribe();
+      response.resolve({ turn: { id: "native-A" } });
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  async function stageNativeSuccessors(
+    successors: number,
+    completeLast: boolean,
+    lateTerminals: boolean,
+    prefix:
+      | "none"
+      | "old_terminal"
+      | "no_foreground_start"
+      | "buffered_unrelated_turn"
+      | "unrelated_turn_without_foreground_start"
+      | "buffered_unrelated_turn_without_foreground_start" = "none",
+  ) {
+    const workdir = await mkdtemp(path.join(tmpdir(), "codex-buffered-native-successors-"));
+    const response = deferred<unknown>();
+    const finalTurnId = `native-B${successors}`;
+    let ordinal = 0;
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => (ordinal++ === 0 ? response.promise : { turn: { id: "native-C" } }),
+      "turn/interrupt": () => {
+        appServer.completeTurn({
+          threadId: "thread-1",
+          turnId: finalTurnId,
+          status: "interrupted",
+        });
+        return {};
+      },
+    });
+    const manager = new AgentManager({
+      clients: { codex: createProviderWithFakeAppServer(appServer) },
+      logger: createTestLogger(),
+    });
+    const agent = await manager.createAgent(createConfig({ cwd: workdir }), undefined, {
+      workspaceId: undefined,
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream") events.push(event.event);
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    const first = await manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "A",
+      expected: { kind: "idle" },
+      clientMessageId: "message-A",
+    });
+    if (first.status !== "accepted") throw new Error("Expected accepted foreground invocation");
+    await appServer.waitForTurnStart();
+    if (
+      prefix === "old_terminal" ||
+      prefix === "buffered_unrelated_turn" ||
+      prefix === "buffered_unrelated_turn_without_foreground_start"
+    ) {
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-old" });
+    }
+    if (
+      prefix === "buffered_unrelated_turn" ||
+      prefix === "unrelated_turn_without_foreground_start" ||
+      prefix === "buffered_unrelated_turn_without_foreground_start"
+    ) {
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-unrelated" });
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-unrelated" });
+    }
+    if (
+      prefix !== "no_foreground_start" &&
+      prefix !== "unrelated_turn_without_foreground_start" &&
+      prefix !== "buffered_unrelated_turn_without_foreground_start"
+    ) {
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+    }
+    appServer.completeTurn({ threadId: "thread-1", turnId: "native-A" });
+    for (let i = 1; i <= successors; i++) {
+      if (lateTerminals && i === successors) {
+        for (let retired = 1; retired <= 64; retired++) {
+          appServer.completeTurn({ threadId: "thread-1", turnId: `native-B${retired}` });
+        }
+      }
+      const turnId = `native-B${i}`;
+      appServer.startsTurn({ threadId: "thread-1", turnId });
+      appServer.child.stdout.write(
+        JSON.stringify({
+          method: "item/completed",
+          params: {
+            threadId: "thread-1",
+            item: { id: `message-B${i}`, type: "agentMessage", text: `Autonomous B${i}` },
+          },
+        }) + "\n",
+      );
+      if (i < successors || completeLast) {
+        appServer.completeTurn({ threadId: "thread-1", turnId });
+      }
+    }
+    response.resolve({ turn: { id: "native-A" } });
+    return {
+      appServer,
+      manager,
+      agent,
+      first,
+      events,
+      finalTurnId,
+      async close() {
+        unsubscribe();
+        response.resolve({ turn: { id: "native-A" } });
+        await manager.closeAgent(agent.id);
+        rmSync(workdir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test.each([
+    { successors: 64, lateTerminals: false, prefix: "none" },
+    { successors: 200, lateTerminals: false, prefix: "none" },
+    { successors: 201, lateTerminals: true, prefix: "none" },
+    { successors: 1, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 64, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 200, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 1, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 200, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "buffered_unrelated_turn" },
+    { successors: 200, lateTerminals: false, prefix: "buffered_unrelated_turn" },
+    { successors: 1, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    { successors: 200, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    {
+      successors: 1,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+    {
+      successors: 64,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+    {
+      successors: 200,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+  ] as const)(
+    "completed native successors beyond the buffer boundary leave the manager idle: $successors, late terminals $lateTerminals, prefix $prefix",
+    async ({ successors, lateTerminals, prefix }) => {
+      const fixture = await stageNativeSuccessors(successors, true, lateTerminals, prefix);
+      const { appServer, manager, agent, first, events, finalTurnId } = fixture;
+      try {
+        await expect.poll(() => manager.getAgent(agent.id)!.activeRun).toBeNull();
+        await manager.flush();
+        expect(manager.getAgent(agent.id)!.lifecycle).toBe("idle");
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: prefix === "buffered_unrelated_turn" ? "turn_failed" : "turn_completed",
+            turnId: "codex-turn-0",
+          }),
+        );
+        if (prefix === "buffered_unrelated_turn") {
+          expect(
+            events.filter(
+              (event) => event.type === "turn_completed" && event.turnId === "codex-turn-0",
+            ),
+          ).toEqual([]);
+          expect(events).toContainEqual(
+            expect.objectContaining({
+              type: "turn_failed",
+              turnId: "codex-turn-0",
+              error: expect.stringContaining("outcome is unknown"),
+            }),
+          );
+        }
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_completed", turnId: finalTurnId }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "timeline",
+            turnId: finalTurnId,
+            item: expect.objectContaining({ text: `Autonomous B${successors}` }),
+          }),
+        );
+        expect(
+          await manager.cancelAgentRunIfCurrent({ agentId: agent.id, expectedRunId: first.runId }),
+        ).toEqual({ status: "mismatch", currentRun: null });
+        expect(
+          await manager.sendAgentMessageIfCurrent({
+            agentId: agent.id,
+            prompt: "C",
+            expected: { kind: "idle" },
+            clientMessageId: "message-C",
+          }),
+        ).toMatchObject({ status: "accepted" });
+        expect(
+          appServer.requests().filter((request) => request.method === "turn/interrupt"),
+        ).toEqual([]);
+        appServer.assertNoErrors();
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  test.each([
+    { successors: 64, lateTerminals: false, prefix: "none" },
+    { successors: 200, lateTerminals: false, prefix: "none" },
+    { successors: 201, lateTerminals: true, prefix: "none" },
+    { successors: 1, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 64, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 200, lateTerminals: false, prefix: "old_terminal" },
+    { successors: 1, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 200, lateTerminals: false, prefix: "no_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "buffered_unrelated_turn" },
+    { successors: 200, lateTerminals: false, prefix: "buffered_unrelated_turn" },
+    { successors: 1, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    { successors: 64, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    { successors: 200, lateTerminals: false, prefix: "unrelated_turn_without_foreground_start" },
+    {
+      successors: 1,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+    {
+      successors: 64,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+    {
+      successors: 200,
+      lateTerminals: false,
+      prefix: "buffered_unrelated_turn_without_foreground_start",
+    },
+  ] as const)(
+    "a running native successor beyond the buffer boundary retains exact cancellation: $successors, late terminals $lateTerminals, prefix $prefix",
+    async ({ successors, lateTerminals, prefix }) => {
+      const fixture = await stageNativeSuccessors(successors, false, lateTerminals, prefix);
+      const { appServer, manager, agent, first, events, finalTurnId } = fixture;
+      try {
+        await expect.poll(() => manager.getAgent(agent.id)!.activeRun?.turnId).toBe(finalTurnId);
+        const current = manager.getAgent(agent.id)!.activeRun!;
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: prefix === "buffered_unrelated_turn" ? "turn_failed" : "turn_completed",
+            turnId: "codex-turn-0",
+          }),
+        );
+        if (prefix === "buffered_unrelated_turn") {
+          expect(
+            events.filter(
+              (event) => event.type === "turn_completed" && event.turnId === "codex-turn-0",
+            ),
+          ).toEqual([]);
+          expect(events).toContainEqual(
+            expect.objectContaining({
+              type: "turn_failed",
+              turnId: "codex-turn-0",
+              error: expect.stringContaining("outcome is unknown"),
+            }),
+          );
+        }
+        expect(current.runId).not.toBe(first.runId);
+        appServer.completeTurn({ threadId: "thread-1", turnId: "native-A" });
+        await manager.flush();
+        expect(manager.getAgent(agent.id)!.activeRun).toEqual(current);
+        expect(
+          await manager.sendAgentMessageIfCurrent({
+            agentId: agent.id,
+            prompt: "C",
+            expected: { kind: "idle" },
+            clientMessageId: "busy-C",
+          }),
+        ).toEqual({ status: "busy", currentRun: current });
+        expect(
+          await manager.cancelAgentRunIfCurrent({ agentId: agent.id, expectedRunId: first.runId }),
+        ).toEqual({ status: "mismatch", currentRun: current });
+        expect(
+          await manager.cancelAgentRunIfCurrent({
+            agentId: agent.id,
+            expectedRunId: current.runId,
+          }),
+        ).toEqual({ status: "cancelled", runId: current.runId });
+        expect(
+          appServer
+            .requests()
+            .filter((request) => request.method === "turn/interrupt")
+            .map((request) => request.params),
+        ).toEqual([{ threadId: "thread-1", turnId: finalTurnId }]);
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_canceled", turnId: finalTurnId }),
+        );
+        expect(manager.getAgent(agent.id)!.activeRun).toBeNull();
+        expect(
+          await manager.sendAgentMessageIfCurrent({
+            agentId: agent.id,
+            prompt: "C",
+            expected: { kind: "idle" },
+            clientMessageId: "accepted-C",
+          }),
+        ).toMatchObject({ status: "accepted" });
+        appServer.assertNoErrors();
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  test("a retired terminal settles a direct caller without changing a successor's native ownership", async () => {
+    let ordinal = 0;
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => ({ turn: { id: ["native-A", "native-B"][ordinal++] } }),
+      "turn/interrupt": () => ({
+        __jsonRpcError: { code: -32600, message: "no active turn to interrupt" },
+      }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    try {
+      const resultA = session.run("A");
+      await appServer.waitForTurnStart();
+      const identifiedA = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      await identifiedA;
+      await session.interrupt();
+      const startedB = await session.startTurn("B");
+      const identifiedB = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-B" });
+      await identifiedB;
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-A" });
+      await resultA;
+      await expect(session.interruptExpectedTurn(startedB.turnId)).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(
+        appServer
+          .requests()
+          .filter((request) => request.method === "turn/interrupt")
+          .map((request) => request.params),
+      ).toEqual([
+        { threadId: "thread-1", turnId: "native-A" },
+        { threadId: "thread-1", turnId: "native-B" },
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("an early unrelated terminal and an unidentified terminal cannot close a bound foreground run", async () => {
+    const response = deferred<{ turn: { id: string } }>();
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => response.promise,
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      const starting = session.startTurn("current turn");
+      await appServer.waitForTurnStart();
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-old" });
+      response.resolve({ turn: { id: "native-current" } });
+      const started = await starting;
+      const identified = waitForCodexTurnEvent(session, "turn_started");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-current" });
+      await identified;
+      appServer.child.stdout.write(
+        JSON.stringify({
+          method: "turn/completed",
+          params: { threadId: "thread-1", turn: { status: "completed" } },
+        }) + "\n",
+      );
+      appServer.completeTurn({ threadId: "another-thread", turnId: "native-current" });
+      await expect(session.interruptExpectedTurn(started.turnId)).resolves.toEqual({
+        status: "interrupted",
+      });
+      expect(events.filter((event) => event.type === "turn_completed")).toEqual([]);
+      const completed = waitForCodexTurnEvent(session, "turn_completed");
+      appServer.completeTurn({ threadId: "thread-1", turnId: "native-current" });
+      expect((await completed).turnId).toBe(started.turnId);
+      appServer.assertNoErrors();
+    } finally {
+      response.resolve({ turn: { id: "native-current" } });
+      await session.close();
+    }
+  });
+});
 
 describe("Codex active-turn steering admission", () => {
   test("a steer without the clearing contract leaves permissions open", async () => {
@@ -4038,7 +5190,7 @@ describe("Codex app-server provider", () => {
 
     asInternals(session).handleNotification("turn/completed", {
       threadId: "test-thread",
-      turn: { status: "completed" },
+      turn: { id: "test-turn", status: "completed" },
     });
     expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
 
@@ -4124,6 +5276,8 @@ describe("Codex app-server provider", () => {
     });
 
     asInternals(session).handleNotification("codex/event/task_complete", {
+      threadId: "test-thread",
+      turnId: "test-turn",
       msg: { type: "task_complete" },
     });
     expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
@@ -5670,9 +6824,7 @@ describe("Codex app-server provider", () => {
         { step: "Implement the button behavior", status: "pending" },
       ],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     expect(events.at(-3)).toEqual({
       type: "timeline",
@@ -5741,9 +6893,7 @@ describe("Codex app-server provider", () => {
         text: "- Inspect README\n- Add a short note",
       },
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     expect(events).not.toContainEqual(
       expect.objectContaining({
@@ -5781,9 +6931,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the first plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     asInternals(session).handleNotification("turn/started", {
       turn: { id: "turn-plan-second" },
@@ -5791,9 +6939,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the revised plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     expect(session.getPendingPermissions()).toEqual([
       expect.objectContaining({
@@ -5816,9 +6962,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the original plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
     const pendingPlan = session.getPendingPermissions()[0];
     expect(pendingPlan).toBeDefined();
 
@@ -5856,9 +7000,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the original plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
     const pendingPlan = session.getPendingPermissions()[0];
     expect(pendingPlan).toBeDefined();
 
@@ -5910,11 +7052,9 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the original plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
-    let acceptPrompt: (() => void) | undefined;
+    let acceptPrompt: ((result: { turn: { id: string } }) => void) | undefined;
     let markPromptRequested: (() => void) | undefined;
     const promptRequested = new Promise<void>((resolve) => {
       markPromptRequested = resolve;
@@ -5925,7 +7065,7 @@ describe("Codex app-server provider", () => {
         if (method === "thread/loaded/list") return { data: ["test-thread"] };
         if (method === "turn/start") {
           markPromptRequested?.();
-          return await new Promise<void>((resolve) => {
+          return await new Promise<{ turn: { id: string } }>((resolve) => {
             acceptPrompt = resolve;
           });
         }
@@ -5935,13 +7075,15 @@ describe("Codex app-server provider", () => {
 
     const startTurn = session.startTurn("Revise the plan");
     await promptRequested;
+    asInternals(session).handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "new-plan-turn" },
+    });
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the newer plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
-    acceptPrompt?.();
+    completeTestTurn(session);
+    acceptPrompt?.({ turn: { id: "new-plan-turn" } });
     await startTurn;
 
     expect(session.getPendingPermissions()).toEqual([
@@ -5960,9 +7102,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the original plan", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
     const pendingPlan = session.getPendingPermissions()[0];
     expect(pendingPlan).toBeDefined();
 
@@ -6206,9 +7346,7 @@ describe("Codex app-server provider", () => {
         },
       }),
     ).not.toThrow();
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     expect(events).toEqual([
       {
@@ -6337,9 +7475,7 @@ describe("Codex app-server provider", () => {
         },
       },
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     expect(events).toContainEqual({
       type: "usage_updated",
@@ -6587,9 +7723,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the new flow", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     const request = events.find(
       (event): event is Extract<AgentStreamEvent, { type: "permission_requested" }> =>
@@ -6641,9 +7775,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the safe flow", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     const request = events.find(
       (event): event is Extract<AgentStreamEvent, { type: "permission_requested" }> =>
@@ -6709,9 +7841,7 @@ describe("Codex app-server provider", () => {
     asInternals(session).handleNotification("turn/plan/updated", {
       plan: [{ step: "Implement the fast flow", status: "pending" }],
     });
-    asInternals(session).handleNotification("turn/completed", {
-      turn: { status: "completed", error: null },
-    });
+    completeTestTurn(session);
 
     const permissionRequest = events.find(
       (event): event is Extract<AgentStreamEvent, { type: "permission_requested" }> =>

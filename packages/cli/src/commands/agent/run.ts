@@ -4,6 +4,7 @@ import {
   StructuredAgentResponseError,
 } from "@getpaseo/server/agent-response";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { CreateAgentWithRunResult } from "@getpaseo/client/internal/daemon-client";
 import { resolveCallerAgentId } from "../../utils/caller-agent.js";
 import { connectToDaemon } from "../../utils/client.js";
 import type {
@@ -95,6 +96,7 @@ export function addRunOptions(cmd: Command): Command {
 /** Result type for agent run command */
 export interface AgentRunResult {
   agentId: string;
+  runId: string | null;
   status: "created" | "running" | "completed" | "timeout" | "permission" | "error";
   provider: string;
   cwd: string;
@@ -161,12 +163,14 @@ function buildRunWorkspaceSource(options: AgentRunOptions, cwd: string) {
   });
 }
 
-function toRunResult(
+export function toRunResult(
   agent: AgentSnapshotPayload,
   statusOverride?: AgentRunResult["status"],
+  originalRunId: string | null = null,
 ): AgentRunResult {
   return {
     agentId: agent.id,
+    runId: originalRunId,
     status: statusOverride ?? (agent.status === "running" ? "running" : "created"),
     provider: agent.provider,
     cwd: agent.cwd,
@@ -312,6 +316,33 @@ function structuredRunSchema(output: Record<string, unknown>): OutputSchema<Agen
   return {
     ...agentRunSchema,
     serialize: () => output,
+  };
+}
+
+export async function finishCreatedAgentRun(input: {
+  client: Pick<ConnectedDaemonClient, "waitForFinish" | "close">;
+  creation: CreateAgentWithRunResult;
+  wait: boolean;
+  waitTimeoutMs: number;
+}): Promise<SingleResult<AgentRunResult>> {
+  const { client, creation, wait, waitTimeoutMs } = input;
+  const { agent, initialRunId } = creation;
+  if (wait) {
+    const state = await client.waitForFinish(agent.id, waitTimeoutMs);
+    await client.close();
+    const finalAgent = state.final ?? agent;
+    const status: AgentRunResult["status"] = state.status === "idle" ? "completed" : state.status;
+    return {
+      type: "single",
+      data: toRunResult(finalAgent, status, initialRunId),
+      schema: agentRunSchema,
+    };
+  }
+  await client.close();
+  return {
+    type: "single",
+    data: toRunResult(agent, undefined, initialRunId),
+    schema: agentRunSchema,
   };
 }
 
@@ -705,7 +736,7 @@ export async function runRunCommand(
     }
 
     // Create the agent
-    const agent = await client.createAgent({
+    const creation = await client.createAgentWithRun({
       provider: resolvedProviderModel.provider,
       cwd: runCwd,
       workspaceId,
@@ -720,28 +751,12 @@ export async function runRunCommand(
       labels: Object.keys(labels).length > 0 ? labels : undefined,
     });
 
-    // Default run behavior is foreground: wait for completion unless --no-wait is set.
-    if (waitsForFinish(options)) {
-      const state = await client.waitForFinish(agent.id, waitTimeoutMs);
-      await client.close();
-
-      const finalAgent = state.final ?? agent;
-      const status: AgentRunResult["status"] = state.status === "idle" ? "completed" : state.status;
-
-      return {
-        type: "single",
-        data: toRunResult(finalAgent, status),
-        schema: agentRunSchema,
-      };
-    }
-
-    await client.close();
-
-    return {
-      type: "single",
-      data: toRunResult(agent),
-      schema: agentRunSchema,
-    };
+    return await finishCreatedAgentRun({
+      client,
+      creation,
+      wait: waitsForFinish(options),
+      waitTimeoutMs,
+    });
   } catch (err) {
     await client.close().catch(() => {});
 

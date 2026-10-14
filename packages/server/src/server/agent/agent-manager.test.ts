@@ -24,6 +24,7 @@ import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { startAgentRun } from "./agent-prompt.js";
+import { MessageReceipts } from "../message-receipts/index.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
@@ -596,6 +597,14 @@ class SteeringTestSession extends TestAgentSession {
     });
   }
 
+  async interruptExpectedTurn(
+    expectedTurnId: string,
+  ): Promise<{ status: "interrupted" | "mismatch" }> {
+    if (expectedTurnId !== `active-turn-${this.startCount}`) return { status: "mismatch" };
+    await this.interrupt();
+    return { status: "interrupted" };
+  }
+
   async steerActiveTurn(
     prompt: AgentPromptInput,
     options: import("./agent-sdk-types.js").SteerActiveTurnOptions,
@@ -619,6 +628,564 @@ class SteeringTestSession extends TestAgentSession {
     return { status: "accepted" };
   }
 }
+
+test("conditional delivery publishes a stable pending run and refuses a concurrent idle send", async () => {
+  const release = deferred<void>();
+  const session = new (class extends SteeringTestSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      await release.promise;
+      return super.startTurn(prompt);
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-start-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const accepted = await manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "first",
+      expected: { kind: "idle" },
+      clientMessageId: "first-id",
+    });
+    expect(accepted.status).toBe("accepted");
+    if (accepted.status !== "accepted") throw new Error("Expected accepted delivery");
+    expect(toAgentPayload(manager.getAgent(agent.id)!).activeRun).toEqual({
+      runId: accepted.runId,
+      phase: "starting",
+      turnId: null,
+    });
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "second",
+        expected: { kind: "idle" },
+        clientMessageId: "second-id",
+      }),
+    ).toEqual({
+      status: "busy",
+      currentRun: { runId: accepted.runId, phase: "starting", turnId: null },
+    });
+    const started = manager.waitForAgentRunStart(agent.id);
+    let didStart = false;
+    void started.then(() => {
+      didStart = true;
+      return didStart;
+    });
+    await Promise.resolve();
+    expect(didStart).toBe(false);
+    release.resolve();
+    await started;
+    expect(toAgentPayload(manager.getAgent(agent.id)!).activeRun).toEqual({
+      runId: accepted.runId,
+      phase: "running",
+      turnId: "active-turn-1",
+    });
+    expect(session.startPrompts).toEqual(["first"]);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("conditional delivery refuses an obsolete run without interrupting its successor", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-stale-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const accepted = await manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "old",
+      expected: { kind: "idle" },
+      clientMessageId: "old-id",
+    });
+    if (accepted.status !== "accepted") throw new Error("Expected accepted delivery");
+    await manager.waitForAgentRunStart(agent.id);
+    const finished = waitForAgentLifecycle(manager, agent.id, "idle");
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await finished;
+    await startAgentRun(manager, agent.id, "human", logger);
+    await manager.waitForAgentRunStart(agent.id);
+    const successor = toAgentPayload(manager.getAgent(agent.id)!).activeRun!;
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "replacement",
+        expected: { kind: "run", runId: accepted.runId },
+        clientMessageId: "replacement-id",
+      }),
+    ).toEqual({ status: "mismatch", currentRun: successor });
+    expect(session.startPrompts).toEqual(["old", "human"]);
+    expect(session.interruptCount).toBe(0);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("conditional delivery restores idle state and the previous run after pre-start persistence fails", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-persist-failure-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const attention = vi.fn();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    onAgentAttention: attention,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const providerStarted = new Promise<void>((resolve) => {
+      session.subscribe((event) => {
+        if (event.type === "turn_started") resolve();
+      });
+    });
+    const previous = manager.runAgent(agent.id, "previous");
+    await manager.waitForAgentRunStart(agent.id);
+    await providerStarted;
+    const previousRunId = toAgentPayload(manager.getAgent(agent.id)!).activeRun!.runId;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await previous;
+    await manager.clearAgentAttention(agent.id);
+    await manager.flush();
+    attention.mockClear();
+    const states: Array<ReturnType<typeof toAgentPayload>> = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") states.push(toAgentPayload(event.agent));
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    vi.spyOn(storage, "applySnapshot").mockRejectedValueOnce(new Error("transient EIO"));
+    await expect(
+      manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "failed prompt",
+        expected: { kind: "idle" },
+        clientMessageId: "failed-invocation",
+      }),
+    ).rejects.toThrow("transient EIO");
+    expect(session.startPrompts).toEqual(["previous"]);
+    expect(manager.hasInFlightRun(agent.id)).toBe(false);
+    expect(toAgentPayload(manager.getAgent(agent.id)!)).toMatchObject({
+      status: "idle",
+      activeRun: null,
+      latestRunId: previousRunId,
+      requiresAttention: false,
+    });
+    expect(states.at(-1)).toMatchObject({
+      status: "idle",
+      activeRun: null,
+      latestRunId: previousRunId,
+      requiresAttention: false,
+    });
+    expect(attention).not.toHaveBeenCalled();
+    const retry = await manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "retry",
+      expected: { kind: "idle" },
+      clientMessageId: "fresh-invocation",
+    });
+    expect(retry.status).toBe("accepted");
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.startPrompts).toEqual(["previous", "retry"]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("failed conditional persistence preserves an autonomous run observed during admission", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-autonomous-rollback-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.flush();
+    vi.spyOn(storage, "applySnapshot").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      throw new Error("transient EIO");
+    });
+    const failed = manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "unstarted conditional prompt",
+      expected: { kind: "idle" },
+      clientMessageId: "unstarted-invocation",
+    });
+    const rejected = expect(failed).rejects.toThrow("transient EIO");
+    await entered.promise;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "autonomous-native-A" });
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: "autonomous-native-A",
+      item: { type: "assistant_message", text: "Autonomous work is running" },
+    });
+    release.resolve();
+    await rejected;
+    await manager.flush();
+    const current = toAgentPayload(manager.getAgent(agent.id)!);
+    expect(current).toMatchObject({
+      status: "running",
+      activeRun: { phase: "running", turnId: "autonomous-native-A" },
+    });
+    expect(current.latestRunId).toBe(current.activeRun!.runId);
+    expect(manager.hasInFlightRun(agent.id)).toBe(true);
+    expect(session.startPrompts).toEqual([]);
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "competing idle prompt",
+        expected: { kind: "idle" },
+        clientMessageId: "competing-idle-invocation",
+      }),
+    ).toEqual({ status: "busy", currentRun: current.activeRun });
+    expect(manager.getTimeline(agent.id)).toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Autonomous work is running" }),
+    );
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("rewind staging preserves the latest invocation without publishing a fictitious run", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-rewind-run-identity-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const session = new (class extends TestAgentSession {
+    override readonly capabilities = { ...TEST_CAPABILITIES, supportsRewindFiles: true };
+    starts = 0;
+    override async startTurn() {
+      this.starts++;
+      return super.startTurn();
+    }
+    async revertFiles() {
+      entered.resolve();
+      await release.promise;
+    }
+  })({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let agentId: string | null = null;
+  let pendingRewind: Promise<void> | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await drainAsyncGenerator(manager.streamAgent(agent.id, "ordinary invocation"));
+    await manager.flush();
+    const invocationId = toAgentPayload(manager.getAgent(agent.id)!).latestRunId;
+    expect(invocationId).toEqual(expect.any(String));
+    const snapshots: ReturnType<typeof toAgentPayload>[] = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") snapshots.push(toAgentPayload(event.agent));
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    const rewind = manager.rewind(agent.id, "provider-message-id", "files");
+    pendingRewind = rewind;
+    await entered.promise;
+    expect(toAgentPayload(manager.getAgent(agent.id)!)).toMatchObject({
+      status: "idle",
+      activeRun: null,
+      latestRunId: invocationId,
+    });
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "competing prompt",
+        expected: { kind: "idle" },
+        clientMessageId: "rewind-competing-invocation",
+      }),
+    ).toEqual({ status: "busy", currentRun: null });
+    release.resolve();
+    await rewind;
+    await manager.flush();
+    expect(session.starts).toBe(1);
+    expect(snapshots.length).toBeGreaterThan(0);
+    for (const snapshot of snapshots) {
+      expect(snapshot).toMatchObject({ activeRun: null, latestRunId: invocationId });
+    }
+    expect((await storage.get(agent.id))!.latestRunId).toBe(invocationId);
+  } finally {
+    release.resolve();
+    if (pendingRewind) await pendingRewind.catch(() => undefined);
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("ordinary human delivery survives a conditional reservation that wins after its precheck", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-human-admission-race-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const receipts = new MessageReceipts(join(workdir, "receipts"));
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const invocation = {
+      agentId: agent.id,
+      messageId: "human-invocation",
+      request: { text: "human" },
+      send: async () => {
+        const conditional = manager.sendAgentMessageIfCurrent({
+          agentId: agent.id,
+          prompt: "conditional",
+          expected: { kind: "idle" },
+          clientMessageId: "conditional-invocation",
+          beforeEffect: async () => {
+            entered.resolve();
+            await release.promise;
+          },
+        });
+        await Promise.resolve();
+        const human = startAgentRun(manager, agent.id, "human", logger, { replaceRunning: true });
+        await entered.promise;
+        release.resolve();
+        expect((await conditional).status).toBe("accepted");
+        expect(await human).toEqual({ disposition: "turn_started" });
+      },
+    };
+    await receipts.send(invocation);
+    await manager.waitForAgentRunStart(agent.id);
+    await new MessageReceipts(join(workdir, "receipts")).send(invocation);
+    expect(session.startPrompts).toEqual(["conditional", "human"]);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each([true, false])(
+  "conditional run identity survives durable reload with provider handle=%s",
+  async (hasHandle) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-latest-run-reload-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    let agentId: string | null = null;
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      agentId = agent.id;
+      const accepted = await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "initial",
+        expected: { kind: "idle" },
+        clientMessageId: "initial-invocation",
+      });
+      if (accepted.status !== "accepted") throw new Error("Expected accepted invocation");
+      await manager.waitForAgentEvent(agent.id);
+      await manager.flush();
+      await manager.reloadAgentSession(agent.id);
+      expect(toAgentPayload(manager.getAgent(agent.id)!).latestRunId).toBe(accepted.runId);
+      await manager.closeAgent(agent.id);
+      const stored = (await storage.get(agent.id))!;
+      expect(stored.latestRunId).toBe(accepted.runId);
+      if (!hasHandle) await storage.upsert({ ...stored, persistence: null });
+      const loaded = await ensureAgentLoaded(agent.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      });
+      expect(toAgentPayload(loaded)).toMatchObject({
+        activeRun: null,
+        latestRunId: accepted.runId,
+      });
+      await manager.flush();
+      expect((await storage.get(agent.id))!.latestRunId).toBe(accepted.runId);
+    } finally {
+      if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("conditional delivery holds admission across cancellation while a human send waits", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new (class extends SteeringTestSession {
+    targets: string[] = [];
+    override async interruptExpectedTurn(
+      turnId: string,
+    ): Promise<{ status: "interrupted" | "mismatch" }> {
+      this.targets.push(turnId);
+      entered.resolve();
+      await release.promise;
+      return super.interruptExpectedTurn(turnId);
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-human-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await startAgentRun(manager, agent.id, "old", logger);
+    await manager.waitForAgentRunStart(agent.id);
+    const originalRun = toAgentPayload(manager.getAgent(agent.id)!).activeRun!;
+    const replacement = manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "replacement",
+      expected: { kind: "run", runId: originalRun.runId },
+      clientMessageId: "replacement-id",
+    });
+    await entered.promise;
+    const human = startAgentRun(manager, agent.id, "human", logger, { replaceRunning: true });
+    expect(session.startPrompts).toEqual(["old"]);
+    expect(() => manager.streamAgent(agent.id, "direct competing start")).toThrow(
+      "admission is reserved",
+    );
+    release.resolve();
+    expect((await replacement).status).toBe("accepted");
+    await human;
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.targets).toEqual(["active-turn-1"]);
+    expect(session.startPrompts).toEqual(["old", "replacement", "human"]);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("conditional delivery revalidates the observed run after asynchronous receipt preparation", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-receipt-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await startAgentRun(manager, agent.id, "old", logger);
+    await manager.waitForAgentRunStart(agent.id);
+    const runId = toAgentPayload(manager.getAgent(agent.id)!).activeRun!.runId;
+    const delivery = manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "obsolete replacement",
+      expected: { kind: "run", runId },
+      clientMessageId: "replacement-id",
+      beforeEffect: async () => {
+        entered.resolve();
+        await release.promise;
+      },
+    });
+    await entered.promise;
+    const finished = waitForAgentLifecycle(manager, agent.id, "idle");
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await finished;
+    const successorStarted = new Promise<void>((resolve) => {
+      const unsubscribe = manager.subscribe(
+        (event) => {
+          if (
+            event.type === "agent_state" &&
+            event.agent.id === agent.id &&
+            event.agent.activeRun?.turnId === "autonomous-successor"
+          ) {
+            unsubscribe();
+            resolve();
+          }
+        },
+        { agentId: agent.id, replayState: false },
+      );
+    });
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "autonomous-successor" });
+    await successorStarted;
+    release.resolve();
+    expect(await delivery).toEqual({
+      status: "mismatch",
+      currentRun: toAgentPayload(manager.getAgent(agent.id)!).activeRun,
+    });
+    expect(session.interruptCount).toBe(0);
+    expect(session.startPrompts).toEqual(["old"]);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 class UnsupportedSteeringSession extends TestAgentSession {
   interruptCount = 0;
@@ -7329,22 +7896,7 @@ test("autonomous events arriving during foreground run are processed via subscri
     return events;
   })();
 
-  // Wait for the foreground turn to start (lifecycle -> running)
-  await new Promise<void>((resolve) => {
-    const unsub = manager.subscribe(
-      (event) => {
-        if (
-          event.type === "agent_state" &&
-          event.agent.id === snapshot.id &&
-          event.agent.lifecycle === "running"
-        ) {
-          unsub();
-          resolve();
-        }
-      },
-      { agentId: snapshot.id, replayState: true },
-    );
-  });
+  await manager.waitForAgentRunStart(snapshot.id);
 
   // Push autonomous events while foreground is active
   const autonomousTurnId = "autonomous-during-fg-1";
@@ -8406,10 +8958,28 @@ test("acknowledged cancellation settles a pending run before it has a turn id", 
     void firstRun.catch(() => undefined);
     await startEntered.promise;
 
-    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+    expect(toAgentPayload(manager.getAgent(agent.id)!).activeRun).toMatchObject({
+      phase: "starting",
+      turnId: null,
+    });
     expect(manager.hasInFlightRun(agent.id)).toBe(true);
 
+    const startOutcome = manager.waitForAgentRunStart(agent.id).then(
+      () => "started",
+      (error: Error) => error.message,
+    );
+    const states: string[] = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state")
+          states.push(`${event.agent.lifecycle}/${event.agent.activeRun?.phase ?? "null"}`);
+      },
+      { agentId: agent.id, replayState: false },
+    );
     await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+    expect(await startOutcome).toBe(`Agent ${agent.id} run finished before starting`);
+    expect(states).not.toContain("running/null");
     expect(manager.hasInFlightRun(agent.id)).toBe(false);
     expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
 
@@ -11853,6 +12423,247 @@ test.each([false, true])(
       expect(manager.getAgent(agent.id)?.lastUserMessageAt).toBeInstanceOf(Date);
     } finally {
       await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("conditional prompt admission serializes a competing archive through the lifecycle lane", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-archive-lane-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let archive: Promise<unknown> | undefined;
+  let agentId: string | undefined;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.markAgentUnread(agent.id);
+    const delivery = manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "admitted prompt",
+      expected: { kind: "idle" },
+      clientMessageId: "conditional-before-archive",
+      beforeEffect: async () => {
+        entered.resolve();
+        await release.promise;
+      },
+    });
+    await entered.promise;
+    let archived = false;
+    archive = manager.archiveAgent(agent.id).then((value) => {
+      archived = true;
+      return value;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(archived).toBe(false);
+    expect((await storage.get(agent.id))!.archivedAt).toBeFalsy();
+    expect(toAgentPayload(manager.getAgent(agent.id)!).requiresAttention).toBe(true);
+    release.resolve();
+    expect((await delivery).status).toBe("accepted");
+    await archive;
+    expect(session.startPrompts).toEqual(["admitted prompt"]);
+    expect((await storage.get(agent.id))!.archivedAt).toEqual(expect.any(String));
+    expect(manager.getAgent(agent.id)).toBeNull();
+  } finally {
+    release.resolve();
+    await archive?.catch(() => undefined);
+    if (agentId && manager.getAgent(agentId))
+      await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("conditional busy and mismatch sends preserve unread state while admitted prompts clear it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-attention-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let agentId: string | undefined;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.markAgentUnread(agent.id);
+    await startAgentRun(manager, agent.id, "ordinary running prompt", logger);
+    await manager.waitForAgentRunStart(agent.id);
+    expect(toAgentPayload(manager.getAgent(agent.id)!).requiresAttention).toBe(true);
+    const current = toAgentPayload(manager.getAgent(agent.id)!).activeRun!;
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "busy prompt",
+        expected: { kind: "idle" },
+        clientMessageId: "busy-id",
+      }),
+    ).toEqual({ status: "busy", currentRun: current });
+    expect(
+      await manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "mismatched prompt",
+        expected: { kind: "run", runId: "other-run" },
+        clientMessageId: "mismatch-id",
+      }),
+    ).toEqual({ status: "mismatch", currentRun: current });
+    expect(toAgentPayload(manager.getAgent(agent.id)!).requiresAttention).toBe(true);
+    const accepted = await manager.sendAgentMessageIfCurrent({
+      agentId: agent.id,
+      prompt: "admitted replacement",
+      expected: { kind: "run", runId: current.runId },
+      clientMessageId: "admitted-id",
+    });
+    expect(accepted.status).toBe("accepted");
+    expect(toAgentPayload(manager.getAgent(agent.id)!).requiresAttention).toBe(false);
+    expect((await storage.get(agent.id))!.requiresAttention).toBe(false);
+    expect(session.startPrompts).toEqual(["ordinary running prompt", "admitted replacement"]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("conditional pre-start persistence failure restores unread state", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-attention-rollback-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let agentId: string | undefined;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.markAgentUnread(agent.id);
+    const unread = toAgentPayload(manager.getAgent(agent.id)!);
+    vi.spyOn(storage, "applySnapshot").mockRejectedValueOnce(new Error("transient EIO"));
+    await expect(
+      manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "unstarted prompt",
+        expected: { kind: "idle" },
+        clientMessageId: "unstarted-id",
+      }),
+    ).rejects.toThrow("transient EIO");
+    expect(toAgentPayload(manager.getAgent(agent.id)!)).toMatchObject({
+      status: "idle",
+      activeRun: null,
+      requiresAttention: true,
+      attentionReason: unread.attentionReason,
+      attentionTimestamp: unread.attentionTimestamp,
+    });
+    expect(session.startPrompts).toEqual([]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each(["resume", "registration"])(
+  "conditional archived prompt restores archival state when interactive %s fails",
+  async (failure) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-archive-rollback-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const client = new (class extends NativeArchiveRecordingClient {
+      failInteractive = false;
+      override async resumeSession(
+        handle: AgentPersistenceHandle,
+        config?: Partial<AgentSessionConfig>,
+        _launch?: AgentLaunchContext,
+        options?: AgentResumeSessionOptions,
+      ): Promise<AgentSession> {
+        if (this.failInteractive && options?.purpose !== "history") {
+          throw new Error("interactive resume failed");
+        }
+        return super.resumeSession(handle, config);
+      }
+    })();
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      const archived = await manager.archiveAgent(agent.id);
+      await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
+      if (failure === "resume") client.failInteractive = true;
+      else {
+        const applySnapshot = storage.applySnapshot.bind(storage);
+        vi.spyOn(storage, "applySnapshot")
+          .mockImplementationOnce(applySnapshot)
+          .mockRejectedValueOnce(new Error("interactive registration failed"));
+      }
+      await expect(
+        manager.sendAgentMessageIfCurrent({
+          agentId: agent.id,
+          prompt: "unstarted archived prompt",
+          expected: { kind: "idle" },
+          clientMessageId: "failed-archived-id",
+        }),
+      ).rejects.toThrow(`interactive ${failure} failed`);
+      expect(client.unarchivedHandles).toHaveLength(1);
+      expect(client.archivedHandles).toHaveLength(2);
+      expect((await storage.get(agent.id))!.archivedAt).toBe(archived.archivedAt);
+      expect(manager.getAgent(agent.id)).toBeNull();
+    } finally {
+      for (const agent of manager.listAgents())
+        await manager.closeAgent(agent.id).catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["idle", "run"])(
+  "conditional %s admission refuses a session closed by an earlier archive without metadata changes",
+  async (expectedKind) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-conditional-earlier-archive-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      const archive = manager.archiveAgent(agent.id);
+      const result = manager.sendAgentMessageIfCurrent({
+        agentId: agent.id,
+        prompt: "obsolete resident snapshot",
+        clientMessageId: "earlier-archive-id",
+        expected:
+          expectedKind === "idle" ? { kind: "idle" } : { kind: "run", runId: "obsolete-run" },
+      });
+      const archived = await archive;
+      expect(await result).toEqual({
+        status: expectedKind === "idle" ? "busy" : "mismatch",
+        currentRun: null,
+      });
+      expect((await storage.get(agent.id))!.archivedAt).toBe(archived.archivedAt);
+      expect(manager.getAgent(agent.id)).toBeNull();
+    } finally {
+      for (const agent of manager.listAgents())
+        await manager.closeAgent(agent.id).catch(() => undefined);
       rmSync(workdir, { recursive: true, force: true });
     }
   },

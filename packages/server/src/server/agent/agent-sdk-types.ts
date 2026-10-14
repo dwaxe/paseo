@@ -200,6 +200,8 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /** Manager-only callback: captures this invocation before provider startup or later native activity. */
+  onRunAdmitted?: (runId: string) => void;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -691,6 +693,10 @@ export interface AgentSession {
    * still uncertain.
    */
   interrupt(): Promise<void>;
+  /** Interrupt only this provider turn; reject a changed identity before any effect. */
+  interruptExpectedTurn?(
+    expectedTurnId: string,
+  ): Promise<{ status: "interrupted" | "mismatch" | "busy" }>;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;

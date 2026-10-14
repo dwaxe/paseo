@@ -810,6 +810,13 @@ const AgentActiveTurnPayloadSchema = z.object({
   startedAt: z.string().nullable(),
 });
 
+export const AgentActiveRunPayloadSchema = z.object({
+  runId: z.string().min(1),
+  phase: z.enum(["starting", "running"]),
+  turnId: z.string().nullable(),
+});
+export type AgentActiveRunPayload = z.infer<typeof AgentActiveRunPayloadSchema>;
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -824,6 +831,10 @@ export const AgentSnapshotPayloadSchema = z.object({
   lastUserMessageAt: z.string().nullable(),
   status: AgentStatusSchema,
   activeTurn: AgentActiveTurnPayloadSchema.nullable().optional(),
+  // COMPAT(agentConditionalDelivery): added after v0.11.2; remove optional parsing after 2027-04-14.
+  activeRun: AgentActiveRunPayloadSchema.nullable().optional(),
+  // COMPAT(agentConditionalCancel): added after v0.11.2; remove optional parsing after 2027-04-14.
+  latestRunId: z.string().min(1).nullable().optional(),
   capabilities: AgentCapabilityFlagsSchema,
   currentModeId: z.string().nullable(),
   availableModes: z.array(AgentModeSchema),
@@ -1374,6 +1385,42 @@ export const SendAgentMessageRequestSchema = z.object({
   attachments: AgentAttachmentsSchema,
 });
 
+export const AgentMessageSendIfCurrentExpectedSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("idle") }),
+  z.object({ kind: z.literal("run"), runId: z.string().min(1) }),
+]);
+export type AgentMessageSendIfCurrentExpected = z.infer<
+  typeof AgentMessageSendIfCurrentExpectedSchema
+>;
+
+export const AgentMessageSendIfCurrentResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("accepted"),
+    runId: z.string().min(1),
+    turnId: z.string().nullable(),
+  }),
+  z.object({
+    status: z.literal("busy"),
+    currentRun: AgentActiveRunPayloadSchema.nullable(),
+  }),
+  z.object({
+    status: z.literal("mismatch"),
+    currentRun: AgentActiveRunPayloadSchema.nullable(),
+  }),
+]);
+export type AgentMessageSendIfCurrentResult = z.infer<typeof AgentMessageSendIfCurrentResultSchema>;
+
+export const AgentMessageSendIfCurrentRequestMessageSchema = z.object({
+  type: z.literal("agent.message.send_if_current.request"),
+  requestId: z.string(),
+  agentId: z.uuid(),
+  messageId: z.string().min(1),
+  text: z.string(),
+  expected: AgentMessageSendIfCurrentExpectedSchema,
+  images: z.array(ImageAttachmentSchema).optional(),
+  attachments: z.array(AgentAttachmentSchema).optional(),
+});
+
 export const WaitForFinishRequestSchema = z.object({
   type: z.literal("wait_for_finish_request"),
   requestId: z.string(),
@@ -1844,6 +1891,14 @@ export const CancelAgentRequestMessageSchema = z.object({
   type: z.literal("cancel_agent_request"),
   agentId: z.string(),
   requestId: z.string().optional(),
+});
+
+export const AgentRunCancelIfCurrentRequestMessageSchema = z.object({
+  type: z.literal("agent.run.cancel_if_current.request"),
+  requestId: z.string(),
+  agentId: z.uuid(),
+  messageId: z.string().min(1),
+  expectedRunId: z.string().min(1),
 });
 
 export const RestartServerRequestMessageSchema = z.object({
@@ -3230,6 +3285,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceRecoveryRestoreRequestSchema,
   SetVoiceModeMessageSchema,
   SendAgentMessageRequestSchema,
+  AgentMessageSendIfCurrentRequestMessageSchema,
   WaitForFinishRequestSchema,
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
@@ -3282,6 +3338,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ImportAgentRequestMessageSchema,
   RefreshAgentRequestMessageSchema,
   CancelAgentRequestMessageSchema,
+  AgentRunCancelIfCurrentRequestMessageSchema,
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
@@ -3574,6 +3631,10 @@ export const ServerInfoStatusPayloadSchema = z
       .object({
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
+        // COMPAT(agentConditionalDelivery): added after v0.11.2; remove optional parsing after 2027-04-14.
+        agentConditionalDelivery: z.boolean().optional(),
+        // COMPAT(agentConditionalCancel): added after v0.11.2; remove optional parsing after 2027-04-14.
+        agentConditionalCancel: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
@@ -4853,6 +4914,23 @@ export const CancelAgentResponseMessageSchema = z.object({
   }),
 });
 
+export const AgentRunCancelIfCurrentResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("cancelled"), runId: z.string().min(1) }),
+  z.object({ status: z.literal("busy"), currentRun: AgentActiveRunPayloadSchema.nullable() }),
+  z.object({ status: z.literal("mismatch"), currentRun: AgentActiveRunPayloadSchema.nullable() }),
+]);
+export type AgentRunCancelIfCurrentResult = z.infer<typeof AgentRunCancelIfCurrentResultSchema>;
+
+export const AgentRunCancelIfCurrentResponseMessageSchema = z.object({
+  type: z.literal("agent.run.cancel_if_current.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    result: AgentRunCancelIfCurrentResultSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const ClearAgentAttentionResponseMessageSchema = z.object({
   type: z.literal("clear_agent_attention_response"),
   payload: z.object({
@@ -4878,6 +4956,8 @@ export const CreationSnapshotSchema = z.object({
   agentId: z.string().nullable(),
   workspace: WorkspaceDescriptorPayloadSchema.optional(),
   agent: AgentSnapshotPayloadSchema.optional(),
+  // COMPAT(agentCreationRun): added after v0.11.2; remove optional parsing after 2027-04-14.
+  initialRunId: z.string().min(1).nullable().optional(),
   error: z.string().nullable(),
   setupSkippedReason: z.string().optional(),
   errorCode: z.string().optional(),
@@ -4964,6 +5044,16 @@ export const SendAgentMessageResponseMessageSchema = z.object({
     requestId: z.string(),
     agentId: z.string(),
     accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentMessageSendIfCurrentResponseMessageSchema = z.object({
+  type: z.literal("agent.message.send_if_current.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    result: AgentMessageSendIfCurrentResultSchema.nullable(),
     error: z.string().nullable(),
   }),
 });
@@ -6932,6 +7022,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentAttentionRequiredMessageSchema,
   AgentForkContextResponseMessageSchema,
   CancelAgentResponseMessageSchema,
+  AgentRunCancelIfCurrentResponseMessageSchema,
   ClearAgentAttentionResponseMessageSchema,
   WorkspaceCreateResponseSchema,
   AgentCreateResponseSchema,
@@ -6941,6 +7032,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceClearAttentionResponseSchema,
   WorkspaceMarkUnreadResponseSchema,
   SendAgentMessageResponseMessageSchema,
+  AgentMessageSendIfCurrentResponseMessageSchema,
   SetVoiceModeResponseMessageSchema,
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
@@ -7153,7 +7245,13 @@ export type AgentTimelineListPromptsResponseMessage = z.infer<
 >;
 export type AgentForkContextResponseMessage = z.infer<typeof AgentForkContextResponseMessageSchema>;
 export type CancelAgentResponseMessage = z.infer<typeof CancelAgentResponseMessageSchema>;
+export type AgentRunCancelIfCurrentResponseMessage = z.infer<
+  typeof AgentRunCancelIfCurrentResponseMessageSchema
+>;
 export type SendAgentMessageResponseMessage = z.infer<typeof SendAgentMessageResponseMessageSchema>;
+export type AgentMessageSendIfCurrentResponseMessage = z.infer<
+  typeof AgentMessageSendIfCurrentResponseMessageSchema
+>;
 export type SetVoiceModeResponseMessage = z.infer<typeof SetVoiceModeResponseMessageSchema>;
 export type SetAgentModeResponseMessage = z.infer<typeof SetAgentModeResponseMessageSchema>;
 export type SetAgentModelResponseMessage = z.infer<typeof SetAgentModelResponseMessageSchema>;
@@ -7261,6 +7359,12 @@ export type ProjectListRequestMessage = z.infer<typeof ProjectListRequestMessage
 export type FetchAgentRequestMessage = z.infer<typeof FetchAgentRequestMessageSchema>;
 export type AgentForkContextRequestMessage = z.infer<typeof AgentForkContextRequestMessageSchema>;
 export type SendAgentMessageRequest = z.infer<typeof SendAgentMessageRequestSchema>;
+export type AgentMessageSendIfCurrentRequestMessage = z.infer<
+  typeof AgentMessageSendIfCurrentRequestMessageSchema
+>;
+export type AgentRunCancelIfCurrentRequestMessage = z.infer<
+  typeof AgentRunCancelIfCurrentRequestMessageSchema
+>;
 export type WaitForFinishRequest = z.infer<typeof WaitForFinishRequestSchema>;
 export type DictationStreamStartMessage = z.infer<typeof DictationStreamStartMessageSchema>;
 export type DictationStreamChunkMessage = z.infer<typeof DictationStreamChunkMessageSchema>;

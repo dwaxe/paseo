@@ -34,6 +34,10 @@ import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outb
 import type {
   AgentStreamEventPayload,
   AgentSnapshotPayload,
+  AgentMessageSendIfCurrentRequestMessage,
+  AgentMessageSendIfCurrentResult,
+  AgentRunCancelIfCurrentRequestMessage,
+  AgentRunCancelIfCurrentResult,
   ProjectPlacementPayload,
   AgentPermissionResolvedMessage,
   CreateAgentRequestMessage,
@@ -433,6 +437,21 @@ export interface SendMessageOptions {
   images?: Array<{ data: string; mimeType: string }>;
   attachments?: SendAgentMessageRequest["attachments"];
 }
+
+export interface CreateAgentWithRunResult {
+  agent: AgentSnapshotPayload;
+  initialRunId: string | null;
+}
+
+export type SendMessageIfCurrentOptions = Pick<
+  AgentMessageSendIfCurrentRequestMessage,
+  "messageId" | "expected" | "images" | "attachments"
+>;
+
+export type CancelAgentRunIfCurrentOptions = Pick<
+  AgentRunCancelIfCurrentRequestMessage,
+  "messageId" | "expectedRunId"
+>;
 
 export interface AgentAttentionRequiredNotification {
   agentId: string;
@@ -2901,13 +2920,18 @@ export class DaemonClient {
   }
 
   async createAgent(options: CreateAgentRequestOptions): Promise<AgentSnapshotPayload> {
+    return (await this.createAgentWithRun(options)).agent;
+  }
+
+  async createAgentWithRun(options: CreateAgentRequestOptions): Promise<CreateAgentWithRunResult> {
     if (options.background !== undefined) this.requireBackgroundWorkspaces();
     const result = await this.creations.createAgent({
       ...options,
       config: resolveAgentConfig(options),
     });
     if (result.error || !result.agent) throw new Error(result.error ?? "Agent creation failed");
-    return result.agent;
+    // COMPAT(agentCreationRun): added after v0.11.2; remove after 2027-04-14 once the daemon floor proves creation runs.
+    return { agent: result.agent, initialRunId: result.creation?.initialRunId ?? null };
   }
 
   private async createLegacyAgent(
@@ -3535,6 +3559,43 @@ export class DaemonClient {
     }
   }
 
+  async sendAgentMessageIfCurrent(
+    agentId: string,
+    text: string,
+    options: SendMessageIfCurrentOptions,
+  ): Promise<AgentMessageSendIfCurrentResult> {
+    // COMPAT(agentConditionalDelivery): added after v0.11.2; remove gate after 2027-04-14.
+    if (this.lastServerInfoMessage?.features?.agentConditionalDelivery !== true) {
+      throw new Error("Update the Paseo host to use conditional message delivery.");
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.message.send_if_current.request",
+      requestId,
+      agentId,
+      text,
+      messageId: options.messageId,
+      expected: options.expected,
+      images: options.images,
+      attachments: options.attachments,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "agent.message.send_if_current.response") return null;
+        if (msg.payload.requestId !== requestId) return null;
+        if (msg.payload.agentId !== agentId) return null;
+        return msg.payload;
+      },
+    });
+    if (payload.error !== null) throw new Error(payload.error);
+    if (payload.result === null)
+      throw new Error("Conditional message delivery returned no result.");
+    return payload.result;
+  }
+
   async sendMessage(agentId: string, text: string, options?: SendMessageOptions): Promise<void> {
     await this.sendAgentMessage(agentId, text, options);
   }
@@ -3596,6 +3657,39 @@ export class DaemonClient {
     if (payload.error) {
       throw new Error(payload.error);
     }
+  }
+
+  async cancelAgentRunIfCurrent(
+    agentId: string,
+    options: CancelAgentRunIfCurrentOptions,
+  ): Promise<AgentRunCancelIfCurrentResult> {
+    // COMPAT(agentConditionalCancel): added after v0.11.2; remove gate after 2027-04-14.
+    if (this.lastServerInfoMessage?.features?.agentConditionalCancel !== true) {
+      throw new Error("Update the Paseo host to use conditional run cancellation.");
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.run.cancel_if_current.request",
+      requestId,
+      agentId,
+      messageId: options.messageId,
+      expectedRunId: options.expectedRunId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "agent.run.cancel_if_current.response") return null;
+        if (msg.payload.requestId !== requestId) return null;
+        if (msg.payload.agentId !== agentId) return null;
+        return msg.payload;
+      },
+    });
+    if (payload.error !== null) throw new Error(payload.error);
+    if (payload.result === null)
+      throw new Error("Conditional run cancellation returned no result.");
+    return payload.result;
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {

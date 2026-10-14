@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import os from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
+import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import type { AgentSession } from "../agent/agent-sdk-types.js";
 
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
@@ -256,3 +258,314 @@ function toAgentEntrySummary(entry: AgentDirectoryEntrySummaryInput) {
     workspaceName: entry.project.workspaceName ?? null,
   };
 }
+
+test("conditional delivery RPC preserves invocation identity and retries across reconnect", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-conditional-rpc-"));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const starts: string[] = [];
+  const daemon = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      onStartTurn: (prompt) => {
+        starts.push(typeof prompt === "string" ? prompt : "structured");
+      },
+      beforeTurnComplete: () => held,
+    }),
+  });
+  let client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  try {
+    await client.connect();
+    expect(client.getLastServerInfoMessage()?.features?.agentConditionalDelivery).toBe(true);
+    const agent = await client.createAgent({ provider: "codex", cwd, modeId: "full-access" });
+    const invocation = { messageId: "conditional-invocation", expected: { kind: "idle" } } as const;
+    const accepted = await client.sendAgentMessageIfCurrent(agent.id, "hello", invocation);
+    expect(accepted.status).toBe("accepted");
+    if (accepted.status !== "accepted") throw new Error("Expected accepted invocation");
+    await daemon.daemon.agentManager.waitForAgentRunStart(agent.id);
+    const current = await client.fetchAgent({ agentId: agent.id });
+    expect(current?.agent.activeRun).toMatchObject({ runId: accepted.runId, phase: "running" });
+    expect(await client.sendAgentMessageIfCurrent(agent.id, "hello", invocation)).toEqual(accepted);
+    expect(
+      await client.sendAgentMessageIfCurrent(agent.id, "later", {
+        messageId: "deferred-invocation",
+        expected: { kind: "idle" },
+      }),
+    ).toEqual({ status: "busy", currentRun: current!.agent.activeRun });
+    await expect(
+      client.sendAgentMessageIfCurrent(agent.id, "different", invocation),
+    ).rejects.toThrow("agent_request_key_conflict");
+    release();
+    await client.waitForFinish(agent.id, 5000);
+    await client.close();
+    client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    await client.connect();
+    expect(await client.sendAgentMessageIfCurrent(agent.id, "hello", invocation)).toEqual(accepted);
+    const restarted = await client.sendAgentMessageIfCurrent(agent.id, "later", {
+      messageId: "deferred-invocation",
+      expected: { kind: "idle" },
+    });
+    expect(restarted.status).toBe("accepted");
+    expect(starts).toEqual(["hello", "later"]);
+  } finally {
+    release();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("creation RPC retains exact initial invocation proof across reconnect", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-creation-run-proof-rpc-"));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const daemon = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({ beforeTurnComplete: () => held }),
+  });
+  let client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  const intent = {
+    provider: "codex",
+    cwd,
+    modeId: "full-access",
+    initialPrompt: "A",
+    idempotencyKey: "creation-run-proof",
+  };
+  try {
+    await client.connect();
+    const creation = await client.createAgentWithRun(intent);
+    expect(creation.initialRunId).toEqual(expect.any(String));
+    expect(creation.agent.activeRun?.runId).toBe(creation.initialRunId);
+    release();
+    await client.waitForFinish(creation.agent.id, 5000);
+    await client.close();
+    client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    await client.connect();
+    expect((await client.createAgentWithRun(intent)).initialRunId).toBe(creation.initialRunId);
+    const unprompted = await client.createAgentWithRun({
+      provider: "codex",
+      cwd,
+      modeId: "full-access",
+    });
+    expect(unprompted.initialRunId).toBeNull();
+  } finally {
+    release();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("conditional cancellation RPC replays its original proof and preserves a successor", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-conditional-cancel-rpc-"));
+  let releaseOld!: () => void;
+  let releaseSuccessor!: () => void;
+  const heldOld = new Promise<void>((resolve) => {
+    releaseOld = resolve;
+  });
+  const heldSuccessor = new Promise<void>((resolve) => {
+    releaseSuccessor = resolve;
+  });
+  const clients = createTestAgentClients({
+    beforeTurnComplete: (prompt) => (prompt === "old" ? heldOld : heldSuccessor),
+  });
+  const codex = clients.codex!;
+  const createSession = codex.createSession.bind(codex);
+  const interruptedTurns: string[] = [];
+  codex.createSession = async (...args) => {
+    const session: AgentSession = await createSession(...args);
+    let currentTurnId: string | null = null;
+    session.subscribe((event) => {
+      if (event.type === "turn_started") currentTurnId = event.turnId ?? null;
+      if (event.type === "turn_completed" || event.type === "turn_canceled") currentTurnId = null;
+    });
+    session.interruptExpectedTurn = async (expectedTurnId) => {
+      if (currentTurnId !== expectedTurnId) return { status: "mismatch" };
+      interruptedTurns.push(expectedTurnId);
+      releaseOld();
+      return { status: "interrupted" };
+    };
+    return session;
+  };
+  const daemon = await createTestPaseoDaemon({ agentClients: clients });
+  let client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  try {
+    await client.connect();
+    expect(client.getLastServerInfoMessage()?.features?.agentConditionalCancel).toBe(true);
+    const agent = await client.createAgent({ provider: "codex", cwd, modeId: "full-access" });
+    const original = await client.sendAgentMessageIfCurrent(agent.id, "old", {
+      messageId: "original-send",
+      expected: { kind: "idle" },
+    });
+    if (original.status !== "accepted") throw new Error("Expected accepted original run");
+    await daemon.daemon.agentManager.waitForAgentRunStart(agent.id);
+    const originalTurn = (await client.fetchAgent({ agentId: agent.id }))!.agent.activeRun!.turnId;
+    const cancellation = { messageId: "original-cancel", expectedRunId: original.runId };
+    const proof = await client.cancelAgentRunIfCurrent(agent.id, cancellation);
+    expect(proof).toEqual({ status: "cancelled", runId: original.runId });
+    expect((await client.fetchAgent({ agentId: agent.id }))!.agent).toMatchObject({
+      activeRun: null,
+      latestRunId: original.runId,
+    });
+
+    const successor = await client.sendAgentMessageIfCurrent(agent.id, "successor", {
+      messageId: "successor-send",
+      expected: { kind: "idle" },
+    });
+    if (successor.status !== "accepted") throw new Error("Expected accepted successor run");
+    await daemon.daemon.agentManager.waitForAgentRunStart(agent.id);
+    await client.close();
+    client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    await client.connect();
+    expect(await client.cancelAgentRunIfCurrent(agent.id, cancellation)).toEqual(proof);
+    const current = (await client.fetchAgent({ agentId: agent.id }))!.agent.activeRun;
+    expect(current?.runId).toBe(successor.runId);
+    expect(
+      await client.cancelAgentRunIfCurrent(agent.id, {
+        messageId: "obsolete-cancel",
+        expectedRunId: original.runId,
+      }),
+    ).toEqual({ status: "mismatch", currentRun: current });
+    await expect(
+      client.cancelAgentRunIfCurrent(agent.id, { ...cancellation, expectedRunId: successor.runId }),
+    ).rejects.toThrow("agent_request_key_conflict");
+    expect(interruptedTurns).toEqual([originalTurn]);
+    expect((await client.fetchAgent({ agentId: agent.id }))!.agent.activeRun?.runId).toBe(
+      successor.runId,
+    );
+  } finally {
+    releaseOld();
+    releaseSuccessor();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("conditional idle send resumes an archived original owner", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-review3-archived-owner-"));
+  const starts: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const daemon = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      onStartTurn: (prompt) => starts.push(typeof prompt === "string" ? prompt : "structured"),
+      beforeTurnComplete: () => held,
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  try {
+    await client.connect();
+    const agent = await client.createAgent({ provider: "codex", cwd, modeId: "full-access" });
+    const archived = await daemon.daemon.agentManager.archiveAgent(agent.id);
+    expect((await daemon.daemon.agentStorage.get(agent.id))!.archivedAt).toBe(archived.archivedAt);
+    const accepted = await client.sendAgentMessageIfCurrent(agent.id, "resume original owner", {
+      messageId: "review3-archived-owner",
+      expected: { kind: "idle" },
+    });
+    expect(accepted.status).toBe("accepted");
+    expect((await daemon.daemon.agentStorage.get(agent.id))!.archivedAt).toBeNull();
+    await daemon.daemon.agentManager.waitForAgentRunStart(agent.id);
+    expect(starts).toEqual(["resume original owner"]);
+  } finally {
+    release();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("conditional idle send restores archive state when archive wins during loading", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-review3-concurrent-archive-"));
+  const starts: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const daemon = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      onStartTurn: (prompt) => starts.push(typeof prompt === "string" ? prompt : "structured"),
+      beforeTurnComplete: () => held,
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  const manager = daemon.daemon.agentManager;
+  const realWait = manager.waitForAgentClose.bind(manager);
+  try {
+    await client.connect();
+    const agent = await client.createAgent({ provider: "codex", cwd, modeId: "full-access" });
+    let archivedAt: string | null = null;
+    manager.waitForAgentClose = async (agentId) => {
+      manager.waitForAgentClose = realWait;
+      archivedAt = (await manager.archiveAgent(agentId)).archivedAt;
+      await realWait(agentId);
+    };
+    const delivered = await client.sendAgentMessageIfCurrent(agent.id, "conditional prompt", {
+      messageId: "review3-concurrent-archive",
+      expected: { kind: "idle" },
+    });
+    await manager.waitForAgentRunStart(agent.id);
+    expect(archivedAt).not.toBeNull();
+    expect(delivered.status).toBe("accepted");
+    expect((await daemon.daemon.agentStorage.get(agent.id))!.archivedAt).toBeNull();
+    expect(starts).toEqual(["conditional prompt"]);
+  } finally {
+    manager.waitForAgentClose = realWait;
+    release();
+    await client.close();
+    await daemon.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each(["send", "cancel"])(
+  "conditional archived %s mismatch preserves archival and unread state",
+  async (operation) => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "paseo-conditional-archived-rejection-"));
+    const starts: string[] = [];
+    const daemon = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => starts.push(typeof prompt === "string" ? prompt : "structured"),
+      }),
+    });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    try {
+      await client.connect();
+      const agent = await client.createAgent({ provider: "codex", cwd, modeId: "full-access" });
+      const archived = await daemon.daemon.agentManager.archiveAgent(agent.id);
+      const original = (await daemon.daemon.agentStorage.get(agent.id))!;
+      await daemon.daemon.agentStorage.upsert({
+        ...original,
+        requiresAttention: true,
+        attentionReason: "finished",
+        attentionTimestamp: archived.archivedAt,
+      });
+      const result =
+        operation === "send"
+          ? await client.sendAgentMessageIfCurrent(agent.id, "obsolete replacement", {
+              messageId: "archived-rejected-send",
+              expected: { kind: "run", runId: "obsolete-run" },
+            })
+          : await client.cancelAgentRunIfCurrent(agent.id, {
+              messageId: "archived-rejected-cancel",
+              expectedRunId: "obsolete-run",
+            });
+      expect(result).toEqual({ status: "mismatch", currentRun: null });
+      expect((await daemon.daemon.agentStorage.get(agent.id))!).toMatchObject({
+        archivedAt: archived.archivedAt,
+        requiresAttention: true,
+        attentionReason: "finished",
+        attentionTimestamp: archived.archivedAt,
+      });
+      expect(starts).toEqual([]);
+    } finally {
+      await client.close();
+      await daemon.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);

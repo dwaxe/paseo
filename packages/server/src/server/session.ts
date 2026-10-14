@@ -461,7 +461,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
-  messageReceipts: Pick<MessageReceipts, "send">;
+  messageReceipts: Pick<MessageReceipts, "send" | "sendIfCurrent" | "cancelIfCurrent">;
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
@@ -798,7 +798,10 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
-  private readonly messageReceipts: Pick<MessageReceipts, "send">;
+  private readonly messageReceipts: Pick<
+    MessageReceipts,
+    "send" | "sendIfCurrent" | "cancelIfCurrent"
+  >;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
@@ -2746,6 +2749,8 @@ export class Session {
   }
 
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    const mutation = this.dispatchAgentRunMutationMessage(msg);
+    if (mutation) return mutation;
     switch (msg.type) {
       case "fetch_agents_request":
         return this.handleFetchAgents(msg);
@@ -2767,8 +2772,6 @@ export class Session {
         return this.handleProjectRenameRequest(msg.projectId, msg.customName, msg.requestId);
       case "project.icon.set.request":
         return this.handleProjectIconSetRequest(msg);
-      case "send_agent_message_request":
-        return this.handleSendAgentMessageRequest(msg);
       case "wait_for_finish_request":
         return this.handleWaitForFinish(msg.agentId, msg.requestId, msg.timeoutMs);
       case "create_agent_request":
@@ -2779,8 +2782,6 @@ export class Session {
         return this.handleImportAgentRequest(msg);
       case "refresh_agent_request":
         return this.handleRefreshAgentRequest(msg);
-      case "cancel_agent_request":
-        return this.handleCancelAgentRequest(msg.agentId, msg.requestId);
       case "agent_permission_response":
         return this.handleAgentPermissionResponse(msg.agentId, msg.requestId, msg.response);
       case "clear_agent_attention":
@@ -2788,6 +2789,17 @@ export class Session {
       default:
         return undefined;
     }
+  }
+
+  private dispatchAgentRunMutationMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    if (msg.type === "send_agent_message_request") return this.handleSendAgentMessageRequest(msg);
+    if (msg.type === "cancel_agent_request")
+      return this.handleCancelAgentRequest(msg.agentId, msg.requestId);
+    if (msg.type === "agent.message.send_if_current.request")
+      return this.handleSendAgentMessageIfCurrent(msg);
+    if (msg.type === "agent.run.cancel_if_current.request")
+      return this.handleCancelAgentRunIfCurrent(msg);
+    return undefined;
   }
 
   private dispatchAgentConfigMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -4324,48 +4336,49 @@ export class Session {
         throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
       }
 
-      const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
-        {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-          paseoHome: this.paseoHome,
-          worktreesRoot: this.worktreesRoot,
-          providerSnapshotManager: this.providerSnapshotManager,
-        },
-        {
-          kind: "session",
-          onAgentReady: async (agent) => {
-            createdAgentId = agent.id;
-            await onAgentReady?.(await this.buildAgentPayload(agent));
+      const { snapshot, liveSnapshot, initialPromptStarted, initialRunId } =
+        await createAgentCommand(
+          {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+            paseoHome: this.paseoHome,
+            worktreesRoot: this.worktreesRoot,
+            providerSnapshotManager: this.providerSnapshotManager,
           },
-          agentId,
-          config: resolvedIntent.config,
-          workspaceId: resolvedIntent.intent.workspaceId,
-          worktreeName,
-          initialPrompt,
-          source: msg.callerAgentId
-            ? { kind: "agent-message", agentId: msg.callerAgentId }
-            : undefined,
-          clientMessageId,
-          outputSchema,
-          images,
-          attachments,
-          git,
-          labels: resolvedIntent.intent.labels,
-          env,
-          provisionalTitle,
-          firstAgentContext,
-          buildSessionConfig: async (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
-            createdWorktree
-              ? {
-                  sessionConfig,
-                  setupContinuation: createdWorktree.setupContinuation,
-                  createdWorkspaceId: createdWorktree.workspace.workspaceId,
-                }
-              : this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
-        },
-      );
+          {
+            kind: "session",
+            onAgentReady: async (agent) => {
+              createdAgentId = agent.id;
+              await onAgentReady?.(await this.buildAgentPayload(agent));
+            },
+            agentId,
+            config: resolvedIntent.config,
+            workspaceId: resolvedIntent.intent.workspaceId,
+            worktreeName,
+            initialPrompt,
+            source: msg.callerAgentId
+              ? { kind: "agent-message", agentId: msg.callerAgentId }
+              : undefined,
+            clientMessageId,
+            outputSchema,
+            images,
+            attachments,
+            git,
+            labels: resolvedIntent.intent.labels,
+            env,
+            provisionalTitle,
+            firstAgentContext,
+            buildSessionConfig: async (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
+              createdWorktree
+                ? {
+                    sessionConfig,
+                    setupContinuation: createdWorktree.setupContinuation,
+                    createdWorkspaceId: createdWorktree.workspace.workspaceId,
+                  }
+                : this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
+          },
+        );
       createdAgentId = snapshot.id;
       await this.agentUpdates.forwardLiveAgent(snapshot);
       if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
@@ -4387,7 +4400,11 @@ export class Session {
         { agentId: snapshot.id, provider: snapshot.provider },
         "Created agent",
       );
-      return { agent: await this.buildAgentPayload(liveSnapshot), initialPromptStarted };
+      return {
+        agent: await this.buildAgentPayload(liveSnapshot),
+        initialPromptStarted,
+        initialRunId,
+      };
     } catch (error) {
       await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
         createdWorktree: createdWorktreeForCleanup,
@@ -8164,6 +8181,89 @@ export class Session {
     if (stored && !stored.title && !stored.lastUserMessageAt) {
       const { provisionalTitle } = resolveCreateAgentTitles({ initialPrompt: text });
       if (provisionalTitle) await this.agentManager.setTitle(agentId, provisionalTitle);
+    }
+  }
+
+  private async handleCancelAgentRunIfCurrent(
+    msg: Extract<SessionInboundMessage, { type: "agent.run.cancel_if_current.request" }>,
+  ): Promise<void> {
+    try {
+      const result = await this.messageReceipts.cancelIfCurrent({
+        agentId: msg.agentId,
+        messageId: msg.messageId,
+        request: { expectedRunId: msg.expectedRunId },
+        send: async (beforeEffect) => {
+          const record = await this.agentStorage.get(msg.agentId);
+          if (!record) throw new Error("Conditional cancellation requires an existing agent");
+          await ensureAgentLoaded(msg.agentId, {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+          });
+          return this.agentManager.cancelAgentRunIfCurrent({
+            agentId: msg.agentId,
+            expectedRunId: msg.expectedRunId,
+            beforeEffect,
+          });
+        },
+      });
+      this.emit({
+        type: "agent.run.cancel_if_current.response",
+        payload: { requestId: msg.requestId, agentId: msg.agentId, result, error: null },
+      });
+    } catch (error) {
+      this.emit({
+        type: "agent.run.cancel_if_current.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          result: null,
+          error: errorToFriendlyMessage(error),
+        },
+      });
+    }
+  }
+
+  private async handleSendAgentMessageIfCurrent(
+    msg: Extract<SessionInboundMessage, { type: "agent.message.send_if_current.request" }>,
+  ): Promise<void> {
+    try {
+      const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
+      const result = await this.messageReceipts.sendIfCurrent({
+        agentId: msg.agentId,
+        messageId: msg.messageId,
+        request: { prompt, expected: msg.expected },
+        send: async (beforeEffect) => {
+          const record = await this.agentStorage.get(msg.agentId);
+          if (!record) throw new Error("Conditional delivery requires an existing agent");
+          await ensureAgentLoaded(msg.agentId, {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+          });
+          return this.agentManager.sendAgentMessageIfCurrent({
+            agentId: msg.agentId,
+            prompt,
+            expected: msg.expected,
+            clientMessageId: msg.messageId,
+            beforeEffect,
+          });
+        },
+      });
+      this.emit({
+        type: "agent.message.send_if_current.response",
+        payload: { requestId: msg.requestId, agentId: msg.agentId, result, error: null },
+      });
+    } catch (error) {
+      this.emit({
+        type: "agent.message.send_if_current.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          result: null,
+          error: errorToFriendlyMessage(error),
+        },
+      });
     }
   }
 

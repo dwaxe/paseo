@@ -144,6 +144,8 @@ function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolea
 
 const TURN_START_TIMEOUT_MS = 90 * 1000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
+const MAX_PENDING_NATIVE_TURNS = 64;
+const MAX_PENDING_NATIVE_NOTIFICATIONS = 128;
 const CODEX_PROVIDER = "codex" as const;
 // Codex treats most app-server client names as the model-request originator.
 // This reserved Codex name is non-originating, so requests keep Codex's default
@@ -273,6 +275,7 @@ interface CodexAppServerClientLike {
 interface CodexAppServerAgentDeps {
   environment?: Record<string, string>;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
+  turnIdentificationTimeoutMs?: number;
   customProvider?: {
     id: string;
     label: string;
@@ -2347,9 +2350,11 @@ function getCodexEventTurnId(params: {
 const CodexEventTurnAbortedNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("turn_aborted"),
         reason: z.string().optional(),
       })
@@ -2360,9 +2365,11 @@ const CodexEventTurnAbortedNotificationSchema = z
 const CodexEventTaskCompleteNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("task_complete"),
       })
       .passthrough(),
@@ -2540,6 +2547,7 @@ type ParsedCodexNotification =
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
+      turnId: string | null;
       status: string;
       errorMessage: string | null;
       threadId: string | null;
@@ -2692,6 +2700,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: params.turn.id ?? null,
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
@@ -3116,6 +3125,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "interrupted",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -3136,6 +3146,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "completed",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -3423,6 +3434,31 @@ interface ConsumedRootCompaction {
   itemId?: string;
 }
 
+interface CodexForegroundNativeTurn {
+  foregroundTurnId: string;
+  nativeTurnId: string;
+  threadId: string;
+  client: CodexAppServerClient;
+}
+
+interface CodexExpectedNativeTurn {
+  client: CodexAppServerClient;
+  threadId: string;
+  expectedTurnId: string;
+  nativeTurnId: string;
+}
+
+type CodexTerminalNotification = Extract<ParsedCodexNotification, { kind: "turn_completed" }>;
+
+interface CodexPendingNativeNotifications {
+  foregroundTurnId: string;
+  client: CodexAppServerClient;
+  threadId: string;
+  terminals: Map<string, CodexTerminalNotification>;
+  deferredNotifications: ParsedCodexNotification[];
+  lifecycleEvidenceCompacted: boolean;
+}
+
 export class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -3440,6 +3476,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
+  private foregroundNativeTurn: CodexForegroundNativeTurn | null = null;
+  private pendingNativeNotifications: CodexPendingNativeNotifications | null = null;
+  private readonly retiredNativeTurns = new Map<string, CodexForegroundNativeTurn>();
   private pendingForegroundTurnIdentification: {
     foregroundTurnId: string;
     promise: Promise<string | null>;
@@ -4386,6 +4425,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
       const turnId = this.createTurnId();
       this.activeForegroundTurnId = turnId;
+      this.foregroundNativeTurn = null;
       this.activeClientMessageId = options?.clientMessageId ?? null;
       this.currentTurnId = null;
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -4411,7 +4451,12 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
-      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      await this.startNativeForegroundTurn({
+        client: this.client,
+        threadId: this.currentThreadId,
+        foregroundTurnId: turnId,
+        params: turnStart.params,
+      });
       return { turnId };
     } catch (error) {
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -4420,10 +4465,145 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.activeClientMessageId = null;
       throw error;
     } finally {
+      this.pendingNativeNotifications = null;
       if (this.pendingForegroundStart === pendingStart) {
         this.pendingForegroundStart = null;
       }
       pendingStart.resolve();
+    }
+  }
+
+  private async startNativeForegroundTurn(input: {
+    client: CodexAppServerClient;
+    threadId: string | null;
+    foregroundTurnId: string;
+    params: unknown;
+  }): Promise<void> {
+    const { client, threadId, foregroundTurnId, params } = input;
+    if (threadId) {
+      this.pendingNativeNotifications = {
+        foregroundTurnId,
+        client,
+        threadId,
+        terminals: new Map(),
+        deferredNotifications: [],
+        lifecycleEvidenceCompacted: false,
+      };
+    }
+    let response: unknown;
+    try {
+      response = await client.request("turn/start", params, TURN_START_TIMEOUT_MS);
+    } catch (error) {
+      const pending = this.pendingNativeNotifications;
+      this.pendingNativeNotifications = null;
+      if (
+        this.client === client &&
+        this.currentThreadId === threadId &&
+        this.activeForegroundTurnId === foregroundTurnId
+      ) {
+        this.activeForegroundTurnId = null;
+        this.foregroundNativeTurn = null;
+        this.activeClientMessageId = null;
+        this.pendingForegroundTurnIdentification?.resolve(null);
+        this.pendingForegroundTurnIdentification = null;
+        // A failed response cannot own an observed native turn. Preserve that
+        // independent activity, including successors queued after its terminal.
+        if (this.currentTurnId) {
+          this.emitEvent({
+            type: "turn_started",
+            provider: CODEX_PROVIDER,
+            turnId: this.currentTurnId,
+          });
+        }
+        this.replayPendingNativeNotifications(pending);
+      }
+      throw error;
+    }
+    const record = toObjectRecord(response);
+    const nativeTurn = record ? toObjectRecord(record.turn) : null;
+    const nativeTurnId = nonEmptyString(nativeTurn?.id);
+    const pendingNotifications = this.pendingNativeNotifications;
+    this.pendingNativeNotifications = null;
+    // Only the correlated start response proves which native turn belongs to
+    // this foreground invocation. An unsolicited notification cannot supply that proof.
+    if (
+      nativeTurnId &&
+      threadId &&
+      this.client === client &&
+      this.currentThreadId === threadId &&
+      this.activeForegroundTurnId === foregroundTurnId
+    ) {
+      this.foregroundNativeTurn = { foregroundTurnId, nativeTurnId, threadId, client };
+    }
+    this.retireCompactedForegroundTurn(pendingNotifications, nativeTurnId);
+    this.replayPendingNativeNotifications(pendingNotifications);
+  }
+
+  private retireCompactedForegroundTurn(
+    pending: CodexPendingNativeNotifications | null,
+    nativeTurnId: string | undefined,
+  ): void {
+    if (
+      !pending?.lifecycleEvidenceCompacted ||
+      this.client !== pending.client ||
+      this.currentThreadId !== pending.threadId ||
+      this.activeForegroundTurnId !== pending.foregroundTurnId
+    )
+      return;
+    if (
+      nativeTurnId &&
+      (this.currentTurnId === nativeTurnId ||
+        pending.terminals.has(nativeTurnId) ||
+        pending.deferredNotifications.some(
+          (notification) =>
+            notification.kind === "turn_started" && notification.turnId === nativeTurnId,
+        ))
+    )
+      return;
+    // The response may identify a lifecycle that bounded replay already compacted.
+    // Retire its synthetic invocation explicitly, then replay the retained native
+    // activity without borrowing its identity or stranding its successor.
+    this.activeForegroundTurnId = null;
+    this.foregroundNativeTurn = null;
+    this.activeClientMessageId = null;
+    this.pendingForegroundTurnIdentification?.resolve(null);
+    this.pendingForegroundTurnIdentification = null;
+    this.emitEvent({
+      type: "turn_failed",
+      provider: CODEX_PROVIDER,
+      turnId: pending.foregroundTurnId,
+      error:
+        "Codex foreground turn outcome is unknown after native lifecycle evidence was compacted",
+    });
+    if (this.currentTurnId) {
+      this.emitEvent({
+        type: "turn_started",
+        provider: CODEX_PROVIDER,
+        turnId: this.currentTurnId,
+      });
+    }
+  }
+
+  private replayPendingNativeNotifications(pending: CodexPendingNativeNotifications | null): void {
+    if (!pending || pending.client !== this.client || pending.threadId !== this.currentThreadId)
+      return;
+    // A terminal followed by an autonomous start must retain that order. The
+    // completed invocation releases its foreground identity before the successor.
+    for (const notification of pending.deferredNotifications) {
+      const ownership = this.foregroundNativeTurn;
+      if (
+        notification.kind === "turn_completed" &&
+        ownership?.foregroundTurnId === pending.foregroundTurnId &&
+        notification.threadId === pending.threadId &&
+        notification.turnId === this.currentTurnId &&
+        notification.turnId !== ownership.nativeTurnId
+      ) {
+        // This observed native predecessor ended before the response-proven
+        // invocation. Retire only its cursor: its terminal cannot finish the
+        // foreground invocation, whose own start notification may be absent.
+        this.currentTurnId = null;
+      }
+      this.dispatchParsedNotification(notification);
     }
   }
 
@@ -4968,6 +5148,111 @@ export class CodexAppServerAgentSession implements AgentSession {
     });
   }
 
+  async interruptExpectedTurn(
+    expectedTurnId: string,
+  ): Promise<{ status: "interrupted" | "mismatch" | "busy" }> {
+    const client = this.client;
+    const threadId = this.currentThreadId;
+    const foregroundTurnId = this.activeForegroundTurnId;
+    const identification = this.pendingForegroundTurnIdentification;
+    if (!client || !threadId || (foregroundTurnId ?? this.currentTurnId) !== expectedTurnId) {
+      return { status: "mismatch" };
+    }
+    const nativeOwnership = foregroundTurnId ? this.foregroundNativeTurn : null;
+    if (
+      foregroundTurnId &&
+      !this.matchesForegroundNativeTurn({ nativeOwnership, foregroundTurnId, client, threadId })
+    ) {
+      return { status: "mismatch" };
+    }
+    let nativeTurnId = this.currentTurnId;
+    if (!nativeTurnId && identification?.foregroundTurnId === foregroundTurnId) {
+      const identified = await this.waitForNativeTurnIdentification(identification.promise);
+      if (identified.status === "busy") return identified;
+      nativeTurnId = identified.turnId;
+    }
+    if (
+      !nativeTurnId ||
+      (nativeOwnership && nativeOwnership.nativeTurnId !== nativeTurnId) ||
+      !this.matchesExpectedNativeTurn({ client, threadId, expectedTurnId, nativeTurnId })
+    ) {
+      return { status: "mismatch" };
+    }
+    try {
+      await client.request(
+        "turn/interrupt",
+        { threadId, turnId: nativeTurnId },
+        INTERRUPT_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (!isCodexAlreadyIdleInterrupt(error)) throw error;
+      // The old native request can reply after a successor has already started.
+      this.acknowledgeAlreadyIdleNativeTurn({ client, threadId, expectedTurnId, nativeTurnId });
+    }
+    return { status: "interrupted" };
+  }
+
+  private async waitForNativeTurnIdentification(
+    identification: Promise<string | null>,
+  ): Promise<{ status: "identified"; turnId: string | null } | { status: "busy" }> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        identification.then((turnId) => ({ status: "identified" as const, turnId })),
+        new Promise<{ status: "busy" }>((resolve) => {
+          timeout = setTimeout(
+            () => resolve({ status: "busy" }),
+            this.deps.turnIdentificationTimeoutMs ?? INTERRUPT_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+
+  private matchesForegroundNativeTurn(input: {
+    nativeOwnership: CodexForegroundNativeTurn | null;
+    foregroundTurnId: string;
+    client: CodexAppServerClient;
+    threadId: string;
+  }): boolean {
+    const { nativeOwnership, foregroundTurnId, client, threadId } = input;
+    return (
+      nativeOwnership !== null &&
+      nativeOwnership.foregroundTurnId === foregroundTurnId &&
+      nativeOwnership.client === client &&
+      nativeOwnership.threadId === threadId
+    );
+  }
+
+  private matchesExpectedNativeTurn(input: CodexExpectedNativeTurn): boolean {
+    return (
+      this.client === input.client &&
+      this.currentThreadId === input.threadId &&
+      (this.activeForegroundTurnId ?? this.currentTurnId) === input.expectedTurnId &&
+      this.currentTurnId === input.nativeTurnId
+    );
+  }
+
+  private acknowledgeAlreadyIdleNativeTurn(input: CodexExpectedNativeTurn): void {
+    if (!this.matchesExpectedNativeTurn(input)) return;
+    if (this.activeForegroundTurnId) {
+      this.rememberRetiredNativeTurn({
+        client: input.client,
+        threadId: input.threadId,
+        foregroundTurnId: this.activeForegroundTurnId,
+        nativeTurnId: input.nativeTurnId,
+      });
+    }
+    this.activeForegroundTurnId = null;
+    this.foregroundNativeTurn = null;
+    this.activeClientMessageId = null;
+    this.currentTurnId = null;
+    this.pendingForegroundTurnIdentification?.resolve(null);
+    this.pendingForegroundTurnIdentification = null;
+  }
+
   async interrupt(): Promise<void> {
     const pendingStart = this.pendingForegroundStart;
     if (pendingStart) {
@@ -5002,11 +5287,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!turnId || (foregroundTurnId && this.activeForegroundTurnId !== foregroundTurnId)) {
       throw new Error("Cannot interrupt Codex before turn/started identifies the active turn");
     }
+    const client = this.client;
+    const threadId = this.currentThreadId;
     try {
-      await this.client.request(
+      await client.request(
         "turn/interrupt",
         {
-          threadId: this.currentThreadId,
+          threadId,
           turnId,
         },
         INTERRUPT_TIMEOUT_MS,
@@ -5015,11 +5302,12 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (!isCodexAlreadyIdleInterrupt(error)) {
         throw error;
       }
-      this.activeForegroundTurnId = null;
-      this.activeClientMessageId = null;
-      this.currentTurnId = null;
-      this.pendingForegroundTurnIdentification?.resolve(null);
-      this.pendingForegroundTurnIdentification = null;
+      this.acknowledgeAlreadyIdleNativeTurn({
+        client,
+        threadId,
+        expectedTurnId: foregroundTurnId ?? turnId,
+        nativeTurnId: turnId,
+      });
     }
   }
 
@@ -5056,6 +5344,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const client = this.client;
     this.connectionState = "disconnected";
     this.currentTurnId = null;
+    this.retiredNativeTurns.clear();
     if (client) {
       await client.dispose();
     }
@@ -5373,7 +5662,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private notifySubscribers(event: AgentStreamEvent): void {
-    const turnId = getAgentStreamEventTurnId(event) ?? this.activeForegroundTurnId;
+    const turnId =
+      getAgentStreamEventTurnId(event) ?? this.activeForegroundTurnId ?? this.currentTurnId;
     const tagged = turnId ? { ...event, turnId } : event;
     this.logger.trace(
       {
@@ -5431,6 +5721,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.dispatchSubAgentNotification(parsed, route.callId);
       return;
     }
+    if (this.deferFollowingRootNotification(parsed)) return;
     this.dispatchParsedNotification(parsed);
   }
 
@@ -6127,9 +6418,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
   }
 
-  private handleTurnCompletedNotification(
-    parsed: Extract<ParsedCodexNotification, { kind: "turn_completed" }>,
-  ): void {
+  private handleTurnCompletedNotification(parsed: CodexTerminalNotification): void {
     const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
     if (subAgentCallId) {
       let status: ToolCallTimelineItem["status"] = "completed";
@@ -6141,16 +6430,27 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
+    const completedTurnId = this.resolveRootTerminalTurnId(parsed);
+    if (!completedTurnId) {
+      this.emitRetiredRootTerminal(parsed);
+      return;
+    }
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({
         type: "turn_failed",
         provider: CODEX_PROVIDER,
+        turnId: completedTurnId,
         error: parsed.errorMessage ?? "Codex turn failed",
       });
     } else if (parsed.status === "interrupted") {
       this.dismissInterruptedAsyncQuestions();
-      this.emitEvent({ type: "turn_canceled", provider: CODEX_PROVIDER, reason: "interrupted" });
+      this.emitEvent({
+        type: "turn_canceled",
+        provider: CODEX_PROVIDER,
+        turnId: completedTurnId,
+        reason: "interrupted",
+      });
     } else {
       if (this.planModeEnabled && this.latestPlanResult?.text) {
         this.emitSyntheticPlanApprovalRequest(this.latestPlanResult.text);
@@ -6158,16 +6458,196 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitEvent({
         type: "turn_completed",
         provider: CODEX_PROVIDER,
+        turnId: completedTurnId,
         usage: this.latestUsage,
       });
     }
     this.activeForegroundTurnId = null;
+    this.foregroundNativeTurn = null;
     this.activeClientMessageId = null;
     this.currentTurnId = null;
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.resetTurnTrackingState();
+  }
+
+  private resolveRootTerminalTurnId(parsed: CodexTerminalNotification): string | null {
+    // A native terminal is evidence only for its own turn. Missing IDs and old
+    // completions must never acquire the currently active foreground identity.
+    if (!parsed.turnId || !this.currentThreadId || parsed.threadId !== this.currentThreadId) {
+      return null;
+    }
+    const foregroundTurnId = this.activeForegroundTurnId;
+    if (!foregroundTurnId) {
+      return this.currentTurnId === parsed.turnId ? parsed.turnId : null;
+    }
+    const nativeOwnership = this.foregroundNativeTurn;
+    if (nativeOwnership) {
+      return nativeOwnership.foregroundTurnId === foregroundTurnId &&
+        nativeOwnership.client === this.client &&
+        nativeOwnership.threadId === parsed.threadId &&
+        nativeOwnership.nativeTurnId === parsed.turnId &&
+        (this.currentTurnId === null || this.currentTurnId === parsed.turnId)
+        ? foregroundTurnId
+        : null;
+    }
+    const pending = this.pendingNativeNotifications;
+    // Older start responses can omit their native mapping. An observed start
+    // still identifies an ordinary terminal once startup has resolved; the
+    // targeted interrupt keeps its stricter correlated-response requirement.
+    if (!pending && this.currentTurnId === parsed.turnId) return foregroundTurnId;
+    this.deferRootTerminalNotification(parsed, foregroundTurnId);
+    return null;
+  }
+
+  private deferRootTerminalNotification(
+    parsed: CodexTerminalNotification,
+    foregroundTurnId: string,
+  ): void {
+    const pending = this.pendingNativeNotifications;
+    if (
+      parsed.turnId &&
+      pending?.foregroundTurnId === foregroundTurnId &&
+      pending.client === this.client &&
+      pending.threadId === parsed.threadId &&
+      !pending.terminals.has(parsed.turnId)
+    ) {
+      if (
+        pending.terminals.size >= MAX_PENDING_NATIVE_TURNS &&
+        !this.compactPendingNativeLifecycle(pending, "terminal")
+      )
+        return;
+      // Codex can finish before turn/start returns. Keep bounded, ID-bearing
+      // evidence until that correlated response proves the foreground mapping.
+      pending.terminals.set(parsed.turnId, parsed);
+      pending.deferredNotifications.push(parsed);
+    }
+  }
+
+  private deferFollowingRootNotification(parsed: ParsedCodexNotification): boolean {
+    const pending = this.pendingNativeNotifications;
+    const threadId = getCodexNotificationThreadId(parsed);
+    if (
+      !pending?.deferredNotifications.length ||
+      pending.client !== this.client ||
+      pending.threadId !== this.currentThreadId ||
+      (threadId !== null && threadId !== pending.threadId)
+    )
+      return false;
+    if (parsed.kind === "turn_completed") {
+      this.deferRootTerminalNotification(parsed, pending.foregroundTurnId);
+      return true;
+    }
+    if (parsed.kind === "turn_started") {
+      if (
+        pending.deferredNotifications.filter((notification) => notification.kind === "turn_started")
+          .length >= MAX_PENDING_NATIVE_TURNS &&
+        !this.compactPendingNativeLifecycle(pending, "start")
+      )
+        return true;
+    } else {
+      const ordinary = (notification: ParsedCodexNotification) =>
+        notification.kind !== "turn_started" && notification.kind !== "turn_completed";
+      if (
+        pending.deferredNotifications.filter(ordinary).length >= MAX_PENDING_NATIVE_NOTIFICATIONS
+      ) {
+        pending.deferredNotifications.splice(pending.deferredNotifications.findIndex(ordinary), 1);
+      }
+    }
+    // Bound terminal identities and starts separately so a burst of assistant
+    // deltas cannot evict the lifecycle proof needed to release an invocation.
+    pending.deferredNotifications.push(parsed);
+    return true;
+  }
+
+  private compactPendingNativeLifecycle(
+    pending: CodexPendingNativeNotifications,
+    capacity: "start" | "terminal",
+  ): boolean {
+    const firstDeferredStart = pending.deferredNotifications.find(
+      (notification) => notification.kind === "turn_started",
+    );
+    for (let start = 0; start < pending.deferredNotifications.length; start++) {
+      const started = pending.deferredNotifications[start]!;
+      if (
+        started.kind !== "turn_started" ||
+        started.turnId === this.currentTurnId ||
+        started === firstDeferredStart
+      )
+        continue;
+      for (let end = start + 1; end < pending.deferredNotifications.length; end++) {
+        const completed = pending.deferredNotifications[end]!;
+        // Only a complete, sequential successor can be compacted. Preserve the
+        // initial unmatched terminal and first buffered start: an unrelated old
+        // terminal can begin buffering before the foreground's native start.
+        // These are possible response proofs, not assigned foreground ownership.
+        // Also retain every successor whose native terminal has not arrived.
+        if (completed.kind === "turn_started") break;
+        if (completed.kind !== "turn_completed") continue;
+        if (
+          completed.turnId !== started.turnId ||
+          completed.threadId !== (started.threadId ?? pending.threadId)
+        )
+          break;
+        pending.deferredNotifications.splice(start, end - start + 1);
+        pending.terminals.delete(started.turnId);
+        pending.lifecycleEvidenceCompacted = true;
+        return true;
+      }
+    }
+    if (capacity === "start") return false;
+    // A compacted successor can publish its duplicate terminal much later.
+    // Those unmatched old terminals must not fill the index and crowd out a
+    // newly observed successor. Retain the initial foreground candidate and
+    // any terminal for the native turn observed before buffering began.
+    for (let index = 1; index < pending.deferredNotifications.length; index++) {
+      const terminal = pending.deferredNotifications[index]!;
+      if (
+        terminal.kind !== "turn_completed" ||
+        !terminal.turnId ||
+        terminal.turnId === this.currentTurnId ||
+        pending.deferredNotifications.some(
+          (notification) =>
+            notification.kind === "turn_started" && notification.turnId === terminal.turnId,
+        )
+      )
+        continue;
+      pending.deferredNotifications.splice(index, 1);
+      pending.terminals.delete(terminal.turnId);
+      pending.lifecycleEvidenceCompacted = true;
+      return true;
+    }
+    return false;
+  }
+
+  private rememberRetiredNativeTurn(turn: CodexForegroundNativeTurn): void {
+    this.retiredNativeTurns.set(turn.nativeTurnId, turn);
+    if (this.retiredNativeTurns.size > 64) {
+      const oldest = this.retiredNativeTurns.keys().next().value;
+      if (oldest !== undefined) this.retiredNativeTurns.delete(oldest);
+    }
+  }
+
+  private emitRetiredRootTerminal(parsed: CodexTerminalNotification): void {
+    if (!parsed.turnId) return;
+    const retired = this.retiredNativeTurns.get(parsed.turnId);
+    if (!retired || retired.client !== this.client || retired.threadId !== parsed.threadId) return;
+    this.retiredNativeTurns.delete(parsed.turnId);
+    // Direct session.run callers still await the old turn's native terminal
+    // after an already-idle reply. Its proof cannot mutate a successor's state.
+    const identity = { provider: CODEX_PROVIDER, turnId: retired.foregroundTurnId };
+    if (parsed.status === "failed") {
+      this.emitEvent({
+        type: "turn_failed",
+        ...identity,
+        error: parsed.errorMessage ?? "Codex turn failed",
+      });
+    } else if (parsed.status === "interrupted") {
+      this.emitEvent({ type: "turn_canceled", ...identity, reason: "interrupted" });
+    } else {
+      this.emitEvent({ type: "turn_completed", ...identity });
+    }
   }
 
   private resetTurnTrackingState(): void {

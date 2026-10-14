@@ -751,11 +751,12 @@ test("waiting for a run start outlasts the slowest provider startup budget", asy
 
     await vi.advanceTimersByTimeAsync(SLOWEST_PROVIDER_STARTUP_BUDGET_MS);
     expect(settled).toBe(false);
-    expect(scenario.agentManager.getAgent(scenario.agentId)?.lifecycle).not.toBe("running");
+    expect(scenario.agentManager.getAgent(scenario.agentId)?.activeRun?.phase).toBe("starting");
 
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(wait).resolves.toBeUndefined();
     expect(scenario.agentManager.getAgent(scenario.agentId)?.lifecycle).toBe("running");
+    expect(scenario.agentManager.getAgent(scenario.agentId)?.activeRun?.phase).toBe("running");
   } finally {
     vi.useRealTimers();
     await scenario.cleanup();

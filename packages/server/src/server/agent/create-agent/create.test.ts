@@ -11,7 +11,7 @@ import { AgentStorage } from "../agent-storage.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { createAgentCommand } from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
-import type { AgentSessionConfig } from "../agent-sdk-types.js";
+import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../agent-sdk-types.js";
 
 const logger = createTestLogger();
 
@@ -64,12 +64,16 @@ test("session create forwards clientMessageId to the initial prompt run options"
     cwd: "/tmp/paseo-create-test",
     runtimeInfo: null,
   } as ManagedAgent;
-  const streamAgent = vi.fn(() => (async function* noop() {})());
+  const streamAgent = vi.fn((_id: string, _prompt: AgentPromptInput, options?: AgentRunOptions) => {
+    options?.onRunAdmitted?.("creation-invocation");
+    return (async function* noop() {})();
+  });
   const dependencies: Parameters<typeof createAgentCommand>[0] = {
     agentManager: {
       createAgent: vi.fn(async () => snapshot),
       getAgent: vi.fn(() => snapshot),
       tryRunOutOfBand: vi.fn(() => false),
+      waitForConditionalDelivery: vi.fn(async () => undefined),
       hasInFlightRun: vi.fn(() => false),
       streamAgent,
       waitForAgentRunStart: vi.fn(async () => undefined),
@@ -79,7 +83,7 @@ test("session create forwards clientMessageId to the initial prompt run options"
     providerSnapshotManager: createProviderSnapshotManagerStub().manager,
   };
 
-  await createAgentCommand(dependencies, {
+  const created = await createAgentCommand(dependencies, {
     kind: "session",
     config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
     workspaceId: "ws-create-test",
@@ -91,10 +95,48 @@ test("session create forwards clientMessageId to the initial prompt run options"
     buildSessionConfig: async (config) => ({ sessionConfig: config }),
   });
 
-  expect(streamAgent).toHaveBeenCalledWith("agent-1", "hello from create", {
-    clientMessageId: "msg-create-1",
-  });
+  expect(streamAgent).toHaveBeenCalledWith(
+    "agent-1",
+    "hello from create",
+    expect.objectContaining({
+      clientMessageId: "msg-create-1",
+    }),
+  );
+  expect(created.initialRunId).toBe("creation-invocation");
 });
+
+test.each([undefined, ""])(
+  "creation without an initial prompt has no invocation proof: %j",
+  async (initialPrompt) => {
+    const workdir = mkdtempSync(join(tmpdir(), "create-without-run-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const agentManager = createRealAgentManager(storage);
+    try {
+      const created = await createAgentCommand(
+        {
+          agentManager,
+          agentStorage: storage,
+          logger,
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        },
+        {
+          kind: "session",
+          config: { provider: "codex", cwd: workdir },
+          workspaceId: "without-run-workspace",
+          initialPrompt,
+          labels: {},
+          provisionalTitle: null,
+          firstAgentContext: {},
+          buildSessionConfig: async (config) => ({ sessionConfig: config }),
+        },
+      );
+      expect(created.initialRunId).toBeNull();
+      expect(created.initialPromptStarted).toBe(false);
+    } finally {
+      await removeRealAgentManagerWorkdir({ agentManager, storage, workdir });
+    }
+  },
+);
 
 test("session create validates the requested mode against the provider's modes", async () => {
   const snapshot = {

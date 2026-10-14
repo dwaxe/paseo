@@ -75,3 +75,98 @@ test("failed local message preparation does not leave an ambiguous receipt", asy
   await requests.send(input);
   expect(sends).toBe(1);
 });
+
+test("conditional busy is retryable and accepted replay preserves the original run across restart", async () => {
+  const { requests, directory } = await fixture();
+  let busy = true;
+  let deliveries = 0;
+  const accepted = { status: "accepted", runId: "original-run", turnId: null } as const;
+  const input = {
+    agentId: "agent",
+    messageId: "invocation",
+    request: { prompt: "hello", expected: { kind: "idle" } },
+    send: async (beforeEffect: () => Promise<void>) => {
+      if (busy) return { status: "busy", currentRun: null } as const;
+      await beforeEffect();
+      deliveries++;
+      return accepted;
+    },
+  };
+  expect(await requests.sendIfCurrent(input)).toEqual({ status: "busy", currentRun: null });
+  busy = false;
+  expect(await Promise.all([requests.sendIfCurrent(input), requests.sendIfCurrent(input)])).toEqual(
+    [accepted, accepted],
+  );
+  busy = true;
+  expect(await new MessageReceipts(directory).sendIfCurrent(input)).toEqual(accepted);
+  expect(deliveries).toBe(1);
+  await expect(
+    requests.sendIfCurrent({
+      ...input,
+      request: { prompt: "hello", expected: { kind: "run", runId: "other-run" } },
+    }),
+  ).rejects.toThrow("agent_request_key_conflict");
+  expect(deliveries).toBe(1);
+});
+
+test("conditional pending outcome never repeats provider effects after reconstruction", async () => {
+  const { requests, directory } = await fixture();
+  let effects = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "uncertain",
+    request: { prompt: "hello" },
+    send: async (beforeEffect: () => Promise<void>): Promise<never> => {
+      await beforeEffect();
+      effects++;
+      throw new Error("connection lost after admission");
+    },
+  };
+  await expect(requests.sendIfCurrent(input)).rejects.toThrow("connection lost after admission");
+  await expect(new MessageReceipts(directory).sendIfCurrent(input)).rejects.toThrow(
+    "agent_request_outcome_unknown",
+  );
+  expect(effects).toBe(1);
+});
+
+test("conditional mismatch after receipt preparation remains retryable", async () => {
+  const { requests, directory } = await fixture();
+  const input = {
+    agentId: "agent",
+    messageId: "rejected",
+    request: { prompt: "hello" },
+    send: async (beforeEffect: () => Promise<void>) => {
+      await beforeEffect();
+      return { status: "mismatch", currentRun: null } as const;
+    },
+  };
+  expect(await requests.sendIfCurrent(input)).toEqual({ status: "mismatch", currentRun: null });
+  expect(await new MessageReceipts(directory).sendIfCurrent(input)).toEqual({
+    status: "mismatch",
+    currentRun: null,
+  });
+});
+
+test("conditional cancellation receipts replay their proof without cancelling a successor", async () => {
+  const { requests, directory } = await fixture();
+  let cancellations = 0;
+  const proof = { status: "cancelled", runId: "original-run" } as const;
+  const input = {
+    agentId: "agent",
+    messageId: "cancel-original",
+    request: { expectedRunId: "original-run" },
+    send: async (beforeEffect: () => Promise<void>) => {
+      await beforeEffect();
+      cancellations++;
+      return proof;
+    },
+  };
+  expect(
+    await Promise.all([requests.cancelIfCurrent(input), requests.cancelIfCurrent(input)]),
+  ).toEqual([proof, proof]);
+  expect(await new MessageReceipts(directory).cancelIfCurrent(input)).toEqual(proof);
+  await expect(
+    requests.cancelIfCurrent({ ...input, request: { expectedRunId: "successor-run" } }),
+  ).rejects.toThrow("agent_request_key_conflict");
+  expect(cancellations).toBe(1);
+});

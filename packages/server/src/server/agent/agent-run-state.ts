@@ -13,6 +13,7 @@ export interface ForegroundTurnWaiter {
 export interface PendingForegroundRun {
   token: string;
   kind: "foreground";
+  purpose: "invocation" | "staging";
   stagedEvents: AgentStreamEvent[];
   start:
     | { status: "pending" }
@@ -43,10 +44,23 @@ export interface ForegroundRunAgentState {
 export class AgentRunState {
   private readonly runs = new Map<string, TrackedAgentRun>();
 
-  createPendingRun(agentId: string): PendingForegroundRun {
-    const pendingRun = createPendingForegroundRun();
+  constructor(
+    private readonly onChange: (agentId: string, run: TrackedAgentRun | null) => void = () => {},
+  ) {}
+
+  createPendingRun(
+    agentId: string,
+    options?: { purpose: PendingForegroundRun["purpose"] },
+  ): PendingForegroundRun {
+    const pendingRun = createPendingForegroundRun(options?.purpose ?? "invocation");
     this.runs.set(agentId, pendingRun);
+    this.onChange(agentId, pendingRun);
     return pendingRun;
+  }
+
+  markStarted(agentId: string, run: PendingForegroundRun, turnId: string): void {
+    run.start = { status: "started", turnId };
+    if (this.runs.get(agentId) === run) this.onChange(agentId, run);
   }
 
   getPendingRun(agentId: string): PendingForegroundRun | null {
@@ -75,9 +89,13 @@ export class AgentRunState {
 
   trackAutonomousRun(agentId: string, turnId: string | null): TrackedAgentRun {
     const current = this.runs.get(agentId);
-    if (current) {
+    if (
+      current &&
+      (current.kind === "foreground" || current.turnId === turnId || turnId === null)
+    ) {
       return current;
     }
+    if (current) settleTrackedRun(current);
 
     const run: AutonomousAgentRun = {
       ...createTrackedRunState(),
@@ -86,6 +104,7 @@ export class AgentRunState {
       started: true,
     };
     this.runs.set(agentId, run);
+    this.onChange(agentId, run);
     return run;
   }
 
@@ -212,8 +231,10 @@ export class AgentRunState {
   }
 
   private clearRun(agentId: string, run: TrackedAgentRun): void {
+    if (this.runs.get(agentId) !== run) return;
     this.runs.delete(agentId);
     settleTrackedRun(run);
+    this.onChange(agentId, null);
   }
 }
 
@@ -276,10 +297,13 @@ export class ForegroundTurnStream {
   }
 }
 
-function createPendingForegroundRun(): PendingForegroundRun {
+function createPendingForegroundRun(
+  purpose: PendingForegroundRun["purpose"],
+): PendingForegroundRun {
   return {
     ...createTrackedRunState(),
     kind: "foreground",
+    purpose,
     start: { status: "pending" },
     stagedEvents: [],
   };

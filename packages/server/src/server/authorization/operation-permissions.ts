@@ -10,6 +10,8 @@ const INBOUND_PERMISSION = {
   "agent.config.apply.request": ["workspace.write", "hub.execute"],
   "agent.detach.request": "workspace.write",
   "agent.fork_context.request": "workspace.read",
+  "agent.message.send_if_current.request": "workspace.write",
+  "agent.run.cancel_if_current.request": "workspace.write",
   "agent.provider_subagents.list.request": "workspace.read",
   "agent.provider_subagents.timeline.get.request": "workspace.read",
   "agent.rewind.request": "workspace.write",
@@ -215,6 +217,8 @@ const INBOUND_PERMISSION = {
 } as const satisfies Record<InboundOperation, PermissionRequirement>;
 
 const OUTBOUND_PERMISSION = {
+  "agent.message.send_if_current.response": "workspace.write",
+  "agent.run.cancel_if_current.response": "workspace.write",
   "agent.create.response": ["workspace.write", "hub.execute"],
   "agent.create.update": ["workspace.write", "hub.execute"],
   "workspace.create.update": "workspace.manage",

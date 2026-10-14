@@ -16,6 +16,7 @@ type Observer = (snapshot: CreationSnapshot) => void;
 export interface CreatedAgent {
   agent: AgentSnapshotPayload;
   initialPromptStarted: boolean;
+  initialRunId?: string | null;
 }
 interface CreationRequest {
   key: string;
@@ -171,7 +172,7 @@ export class CreationService {
       if (input.hasAgent && input.createAgent && !record.snapshot.agent) {
         record.inFlight = "agent";
         await this.write(identity, record);
-        const { agent, initialPromptStarted } = await input.createAgent(
+        const { agent, initialPromptStarted, initialRunId } = await input.createAgent(
           record.snapshot.agentId!,
           record.snapshot.workspace,
           async (readyAgent) => {
@@ -185,8 +186,8 @@ export class CreationService {
         );
         record.inFlight = null;
         if (initialPromptStarted)
-          await this.publish(identity, record, { phase: "prompt_started", agent });
-        else record.snapshot = { ...record.snapshot, agent };
+          await this.publish(identity, record, { phase: "prompt_started", agent, initialRunId });
+        else record.snapshot = { ...record.snapshot, agent, initialRunId };
       }
       record.inFlight = null;
       await this.publish(identity, record, { phase: "completed" });

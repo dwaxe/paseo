@@ -82,6 +82,7 @@ export function toStoredAgentRecord(
     updatedAt: agent.updatedAt.toISOString(),
     lastActivityAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
+    latestRunId: agent.latestRunId ?? null,
     title: options?.title ?? null,
     labels: agent.labels,
     lastStatus: agent.lifecycle,
@@ -125,6 +126,8 @@ export function toAgentPayload(
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
     status: agent.lifecycle,
+    activeRun: agent.activeRun ?? null,
+    latestRunId: agent.latestRunId ?? null,
     activeTurn: agent.activeTurnId
       ? {
           turnId: agent.activeTurnId,
@@ -237,6 +240,7 @@ export function buildStoredAgentPayload(
     createdAt: createdAt.toISOString(),
     updatedAt: updatedAt.toISOString(),
     lastUserMessageAt: lastUserMessageAt ? lastUserMessageAt.toISOString() : null,
+    latestRunId: record.latestRunId,
     status: record.lastStatus,
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,

@@ -93,7 +93,7 @@ async function fixture() {
       calls.push("agent");
       await onReady(agent);
       calls.push("prompt");
-      return { agent, initialPromptStarted: true };
+      return { agent, initialPromptStarted: true, initialRunId: "initial-invocation" };
     },
   };
   const updates: CreationSnapshot[] = [];
@@ -113,7 +113,13 @@ test("workspace readiness is observable before provider startup and duplicate re
   expect(f.updates[0]).toMatchObject({ workspaceId: workspace.id, agentId: agent.id });
   const duplicate = f.service.create(f.input);
   f.provider.resolve();
-  expect(await first).toMatchObject({ phase: "completed", error: null, workspace, agent });
+  expect(await first).toMatchObject({
+    phase: "completed",
+    error: null,
+    workspace,
+    agent,
+    initialRunId: "initial-invocation",
+  });
   expect(await duplicate).toEqual(await first);
   expect(f.calls).toEqual(["workspace", "agent", "prompt"]);
   expect(await new CreationService(f.directory, silentLogger).create(f.input)).toEqual(await first);
