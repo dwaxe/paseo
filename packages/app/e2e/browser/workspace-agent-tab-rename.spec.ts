@@ -4,7 +4,13 @@ import { AGENT_NOTIFICATIONS_MUTED_LABEL } from "@getpaseo/protocol/agent-labels
 import { randomUUID } from "node:crypto";
 import { test, expect, type Page } from "../support/fixtures";
 import { seedWorkspace, type SeedDaemonClient } from "../support/helpers/seed-client";
-import { createMockIdleAgent, expectWorkspaceTabVisible } from "../support/helpers/archive-tab";
+import {
+  clickSessionRow,
+  createMockIdleAgent,
+  expectArchivedAgentFocused,
+  expectWorkspaceTabVisible,
+  openSessions,
+} from "../support/helpers/archive-tab";
 import { waitForWorkspaceTabsVisible } from "../support/helpers/workspace-tabs";
 import { buildHostAgentDetailRoute } from "@/utils/host-routes";
 import { renameModalInput, renameModalSubmit } from "../support/helpers/rename";
@@ -98,7 +104,7 @@ async function persistedAgent(recordPath: string): Promise<unknown> {
   return JSON.parse(await readFile(recordPath, "utf8"));
 }
 
-async function openNotificationMenu(page: Page, agentId: string, compact = false) {
+async function openAgentTabMenu(page: Page, agentId: string, compact = false) {
   if (compact) {
     await page.getByTestId("workspace-tab-switcher-trigger").click();
     await page.getByTestId(`workspace-tab-menu-agent_${agentId}-trigger`).click();
@@ -106,10 +112,43 @@ async function openNotificationMenu(page: Page, agentId: string, compact = false
     await page.getByTestId(`workspace-tab-agent_${agentId}`).first().click({ button: "right" });
   }
   const prefix = compact ? "workspace-tab-menu" : "workspace-tab-context";
+  const menu = page.getByTestId(`${prefix}-agent_${agentId}`);
   const action = page.getByTestId(`${prefix}-agent_${agentId}-notification-mute`);
+  return { menu, action };
+}
+
+async function openNotificationMenu(page: Page, agentId: string, compact = false) {
+  const { action } = await openAgentTabMenu(page, agentId, compact);
   await expect(action).toBeVisible();
   return action;
 }
+
+test("archived history tabs omit notification mute", async ({ page }) => {
+  test.setTimeout(120_000);
+  const workspace = await seedWorkspace({ repoPrefix: "archived-agent-notification-mute-" });
+  try {
+    const agent = await createMockIdleAgent(workspace.client, {
+      cwd: workspace.repoPath,
+      workspaceId: workspace.workspaceId,
+      title: "Archived communication helper",
+    });
+    await openAgentInWorkspace(page, agent);
+    await openNotificationMenu(page, agent.id);
+    await page.keyboard.press("Escape");
+    const { archivedAt } = await workspace.client.archiveAgent(agent.id);
+    await openSessions(page);
+    await clickSessionRow(page, agent.title);
+    await expectArchivedAgentFocused(page, agent.id);
+    const { menu, action } = await openAgentTabMenu(page, agent.id);
+    await expect(menu.getByText("Copy agent id", { exact: true })).toBeVisible();
+    await expect(action).toHaveCount(0);
+    expect((await workspace.client.fetchAgent({ agentId: agent.id }))?.agent.archivedAt).toBe(
+      archivedAt,
+    );
+  } finally {
+    await workspace.cleanup();
+  }
+});
 
 for (const compact of [false, true]) {
   test(`notification mute persists and can be undone from the ${compact ? "compact switcher" : "right-click menu"}`, async ({
