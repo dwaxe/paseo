@@ -263,6 +263,20 @@ paseo ls -a -g --json       # All agents, including archived, as JSON
 paseo ls --background       # Also include agents in background workspaces
 ```
 
+## Agent notifications
+
+Choose **Mute notifications** from an agent tab's context menu to silence that agent's
+desktop alerts and mobile push notifications. Choose **Unmute notifications** to restore
+them. Muting applies across connected devices and survives daemon restarts; agent activity,
+status, and permission controls remain available in the app.
+
+On hosts that support per-agent muting, scripts can set the same preference with a label:
+
+```bash
+paseo agent update abc123 --label paseo.notifications-muted=true
+paseo agent update abc123 --label paseo.notifications-muted=false
+```
+
 ## Streaming output
 
 Use `paseo attach` to stream an agent's output in real-time:
