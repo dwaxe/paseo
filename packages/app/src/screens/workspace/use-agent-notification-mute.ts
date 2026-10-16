@@ -109,7 +109,9 @@ export function useAgentNotificationMute(serverId: string) {
       }
       const session = useSessionStore.getState().sessions[serverId];
       const agent = session?.agents.get(agentId);
-      if (agent) mutate({ agentId, muted: !areAgentNotificationsMuted(agent) });
+      if (agent && !agent.archivedAt) {
+        mutate({ agentId, muted: !areAgentNotificationsMuted(agent) });
+      }
     },
     [mutate, mutationKey, queryClient, serverId],
   );
@@ -120,7 +122,7 @@ export function useAgentNotificationMute(serverId: string) {
       const { agentId } = tab.target;
       const agent = agents?.get(agentId);
       // Archived/history-only agents do not send alerts; restore them before changing mute.
-      if (!agent) return undefined;
+      if (!agent || agent.archivedAt) return undefined;
       const status = statusByAgent.get(agentId);
       return {
         muted: areAgentNotificationsMuted(agent),

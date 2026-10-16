@@ -1,10 +1,19 @@
+// @vitest-environment jsdom
+
+import { createElement, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { AGENT_NOTIFICATIONS_MUTED_LABEL } from "@getpaseo/protocol/agent-labels";
 import { useSessionStore } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { AgentStoreProjection } from "@/runtime/directory-sync/internal/agent-store";
-import { updateAgentNotificationMute } from "./use-agent-notification-mute";
+import {
+  updateAgentNotificationMute,
+  useAgentNotificationMute,
+} from "./use-agent-notification-mute";
+import type { WorkspaceTabDescriptor } from "./workspace-tabs-types";
 
 const SERVER_ID = "notification-mute-test";
 const snapshot: AgentSnapshotPayload = {
@@ -37,7 +46,53 @@ beforeEach(() => {
   const agent = normalizeAgentSnapshot(snapshot, SERVER_ID);
   useSessionStore.getState().setAgents(SERVER_ID, new Map([[agent.id, agent]]));
 });
-afterEach(() => useSessionStore.getState().clearSession(SERVER_ID));
+afterEach(() => {
+  cleanup();
+  useSessionStore.getState().clearSession(SERVER_ID);
+});
+
+const agentTab: WorkspaceTabDescriptor = {
+  key: "agent_agent-1",
+  tabId: "agent_agent-1",
+  kind: "agent",
+  target: { kind: "agent", agentId: snapshot.id },
+};
+
+function renderMuteActions() {
+  useSessionStore.getState().updateSessionServerInfo(SERVER_ID, {
+    serverId: SERVER_ID,
+    hostname: null,
+    version: "0.12.0",
+    features: { agentNotificationMute: true },
+  });
+  const queryClient = new QueryClient();
+  function Wrapper({ children }: { children: ReactNode }) {
+    return createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+  return {
+    ...renderHook(() => useAgentNotificationMute(SERVER_ID), { wrapper: Wrapper }),
+    queryClient,
+  };
+}
+
+describe("agent notification mute eligibility", () => {
+  it("omits the action for archived agents retained in the directory", () => {
+    new AgentStoreProjection(SERVER_ID).archive(snapshot.id, "2026-10-16T00:00:01.000Z");
+    const { result } = renderMuteActions();
+    expect(result.current(agentTab)).toBeUndefined();
+  });
+
+  it("ignores a menu action captured before the agent was archived", () => {
+    const { result, queryClient } = renderMuteActions();
+    const action = result.current(agentTab);
+    if (!action) throw new Error("Expected an active agent mute action");
+    act(() => {
+      new AgentStoreProjection(SERVER_ID).archive(snapshot.id, "2026-10-16T00:00:01.000Z");
+      action.onToggle();
+    });
+    expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
+  });
+});
 
 function currentAgent() {
   const agent = useSessionStore.getState().sessions[SERVER_ID]?.agents.get(snapshot.id);
