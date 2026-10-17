@@ -167,9 +167,9 @@ for (const compact of [false, true]) {
       const recordPath = await agentRecordPath(agent.id);
       await openAgentInWorkspace(page, agent, compact);
       const action = await openNotificationMenu(page, agent.id, compact);
-      await expect(action).toHaveText("Mute notifications");
+      await expect(action).toHaveText("Mute completion alerts");
       await action.click();
-      await expect(action).toHaveText("Unmute notifications");
+      await expect(action).toHaveText("Unmute completion alerts");
       await expect
         .poll(() => persistedAgent(recordPath))
         .toMatchObject({
@@ -181,9 +181,9 @@ for (const compact of [false, true]) {
       if (compact) await expect(page.getByTestId("workspace-tab-switcher-trigger")).toBeVisible();
       else await waitForWorkspaceTabsVisible(page);
       const reloadedAction = await openNotificationMenu(page, agent.id, compact);
-      await expect(reloadedAction).toHaveText("Unmute notifications");
+      await expect(reloadedAction).toHaveText("Unmute completion alerts");
       await reloadedAction.click();
-      await expect(reloadedAction).toHaveText("Mute notifications");
+      await expect(reloadedAction).toHaveText("Mute completion alerts");
       await expect
         .poll(() => persistedAgent(recordPath))
         .toMatchObject({
@@ -227,7 +227,7 @@ test("notification mute keeps a real persistence failure visible and retries", a
     await restoreRecord();
     restoreRecord = undefined;
     await action.click();
-    await expect(action).toHaveText("Unmute notifications");
+    await expect(action).toHaveText("Unmute completion alerts");
     await expect(page.getByText("Save failed. Select to retry.", { exact: true })).toHaveCount(0);
     await expect
       .poll(() => persistedAgent(recordPath))

@@ -91,7 +91,7 @@ import {
 import { useAgentNotificationMute } from "./use-agent-notification-mute";
 import { useSessionStore } from "@/stores/session-store";
 
-const DROPDOWN_WIDTH = 220;
+const DROPDOWN_WIDTH = 240;
 const DEFAULT_INLINE_ADD_BUTTON_RESERVED_WIDTH = 36;
 const PANE_SPLIT_ACTIONS_HORIZONTAL_PADDING = 2;
 const PANE_SPLIT_ACTIONS_OUTER_MARGIN =

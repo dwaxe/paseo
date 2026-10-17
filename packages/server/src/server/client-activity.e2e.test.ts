@@ -248,7 +248,7 @@ describe("client activity tracking", () => {
     });
   });
 
-  test("muted agents still expose errors without notifying a present client", async () => {
+  test("muted agents retain normal error alerts for a present client", async () => {
     client1 = await createClient();
     const agent = await createAgent({ client: client1, title: "Muted error" });
     await client1.updateAgent(agent.id, { labels: { [AGENT_NOTIFICATIONS_MUTED_LABEL]: "true" } });
@@ -264,7 +264,7 @@ describe("client activity tracking", () => {
     const attention = await attentionPromise;
 
     expect(attention.reason).toBe("error");
-    expect(attention.shouldNotify).toBe(false);
+    expect(attention.shouldNotify).toBe(true);
     expect(pushNotifications.sent).toEqual([]);
     expect((await client1.fetchAgent({ agentId: agent.id }))?.agent).toMatchObject({
       status: "error",
@@ -274,7 +274,7 @@ describe("client activity tracking", () => {
     });
   });
 
-  test("muted permission requests remain actionable without sending push alerts", async () => {
+  test("muted agents still push permission alerts and keep completion alerts quiet", async () => {
     client1 = await createClient();
     const agent = await createAgent({ client: client1, title: "Muted permission" });
     await client1.updateAgent(agent.id, { labels: { [AGENT_NOTIFICATIONS_MUTED_LABEL]: "true" } });
@@ -284,7 +284,11 @@ describe("client activity tracking", () => {
 
     expect(attention.reason).toBe("permission");
     expect(attention.shouldNotify).toBe(false);
-    expect(pushNotifications.sent).toEqual([]);
+    expect(pushNotifications.sent).toHaveLength(1);
+    expect(pushNotifications.sent[0]?.data).toMatchObject({
+      agentId: agent.id,
+      reason: "permission",
+    });
     const snapshot = (await client1.fetchAgent({ agentId: agent.id }))?.agent;
     expect(snapshot?.status).toBe("running");
     expect(snapshot?.pendingPermissions).toHaveLength(1);
@@ -295,13 +299,43 @@ describe("client activity tracking", () => {
     const completion = await completionPromise;
     expect(completion.reason).toBe("finished");
     expect(completion.shouldNotify).toBe(false);
-    expect(pushNotifications.sent).toEqual([]);
+    expect(pushNotifications.sent).toHaveLength(1);
     expect((await client1.fetchAgent({ agentId: agent.id }))?.agent).toMatchObject({
       status: "idle",
       pendingPermissions: [],
       requiresAttention: true,
       attentionReason: "finished",
     });
+  });
+
+  test("muted agents still notify a present client about permission requests", async () => {
+    client1 = await createClient();
+    const agent = await createAgent({ client: client1, title: "Muted in-app permission" });
+    await client1.updateAgent(agent.id, { labels: { [AGENT_NOTIFICATIONS_MUTED_LABEL]: "true" } });
+    client1.sendHeartbeat({
+      deviceType: "web",
+      focusedAgentId: null,
+      lastActivityAt: new Date().toISOString(),
+      appVisible: true,
+    });
+    await client1.ping();
+    const attentionPromise = waitForAttentionRequired(client1, agent.id);
+    await client1.sendMessage(agent.id, "Run rm -f permission.txt");
+    const attention = await attentionPromise;
+
+    expect(attention.reason).toBe("permission");
+    expect(attention.shouldNotify).toBe(true);
+    expect(pushNotifications.sent).toEqual([]);
+    const snapshot = (await client1.fetchAgent({ agentId: agent.id }))?.agent;
+    const permission = snapshot?.pendingPermissions[0];
+    if (!permission) throw new Error("Expected pending permission request");
+    const completionPromise = waitForAttentionRequired(client1, agent.id);
+    await client1.respondToPermission(agent.id, permission.id, { behavior: "allow" });
+    const completion = await completionPromise;
+    expect(completion.reason).toBe("finished");
+    expect(completion.shouldNotify).toBe(false);
+    expect(pushNotifications.sent).toEqual([]);
+    expect((await client1.fetchAgent({ agentId: agent.id }))?.agent.pendingPermissions).toEqual([]);
   });
 
   describe("single client - basic cases", () => {

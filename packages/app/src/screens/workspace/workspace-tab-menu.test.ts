@@ -66,7 +66,7 @@ describe("buildWorkspaceTabMenuEntries", () => {
         (candidate) => candidate.kind === "item" && candidate.key === "notification-mute",
       );
       expect(entry).toMatchObject({
-        label: "Mute notifications",
+        label: "Mute completion alerts",
         icon: "bell-off",
         closeOnSelect: false,
       });
@@ -78,7 +78,7 @@ describe("buildWorkspaceTabMenuEntries", () => {
 
   it("shows unmute for a muted agent and disables the pending action", () => {
     expect(notificationMenu({ muted: true, status: "pending", onToggle: vi.fn() })).toMatchObject({
-      label: "Unmute notifications",
+      label: "Unmute completion alerts",
       icon: "bell",
       disabled: true,
       status: "pending",
@@ -87,7 +87,7 @@ describe("buildWorkspaceTabMenuEntries", () => {
 
   it("keeps a retryable failure in the mute action", () => {
     expect(notificationMenu({ muted: false, status: "error", onToggle: vi.fn() })).toMatchObject({
-      label: "Mute notifications",
+      label: "Mute completion alerts",
       disabled: false,
       description: "Save failed. Select to retry.",
       closeOnSelect: false,

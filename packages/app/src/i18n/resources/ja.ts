@@ -653,8 +653,8 @@ export const ja: TranslationResources = {
         closeRight: "右のタブを閉じる",
         closeOthers: "他のタブを閉じる",
         moveToMain: "メインパネルへ移動",
-        muteNotifications: "通知をミュート",
-        unmuteNotifications: "通知のミュートを解除",
+        muteNotifications: "完了通知をミュート",
+        unmuteNotifications: "完了通知のミュートを解除",
         notificationMuteFailed: "保存できませんでした。選択して再試行。",
         reloadAgent: "エージェントを再読み込み",
         reloadAgentTooltip:

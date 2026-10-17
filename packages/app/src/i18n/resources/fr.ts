@@ -652,8 +652,8 @@ export const fr: TranslationResources = {
         closeRight: "Fermer les onglets à droite",
         closeOthers: "Fermer les autres onglets",
         moveToMain: "Déplacer vers le panneau principal",
-        muteNotifications: "Désactiver les notifications",
-        unmuteNotifications: "Réactiver les notifications",
+        muteNotifications: "Couper les alertes de fin",
+        unmuteNotifications: "Rétablir les alertes de fin",
         notificationMuteFailed: "Échec. Sélectionnez pour réessayer.",
         reloadAgent: "Recharger l’agent",
         reloadAgentTooltip:

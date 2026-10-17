@@ -70,6 +70,7 @@ import type { SpeechReadinessSnapshot, SpeechService } from "./speech/speech-run
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
 import {
   computeNotificationPlan,
+  isAgentAttentionMuted,
   isPushEligibleAttentionReason,
   type ClientPresenceState,
 } from "./agent-attention-policy.js";
@@ -2629,8 +2630,9 @@ export class VoiceAssistantWebSocketServer {
     const currentAgent = this.agentManager.getAgent(params.agentId);
     if (!currentAgent) return;
     const notificationsMuted = areAgentNotificationsMuted(currentAgent);
+    const attentionMuted = isAgentAttentionMuted({ reason: params.reason, notificationsMuted });
 
-    if (!notificationsMuted && plan.shouldPush) {
+    if (!attentionMuted && plan.shouldPush) {
       void this.pushNotificationSender.send(notification).catch((err) => {
         this.logger.warn({ err, agentId: params.agentId }, "Failed to send push notification");
       });
@@ -2638,7 +2640,7 @@ export class VoiceAssistantWebSocketServer {
 
     for (const { ws } of clientEntries) {
       const shouldNotify =
-        !notificationsMuted &&
+        !attentionMuted &&
         plan.inAppRecipientIndex !== null &&
         notificationEntries[plan.inAppRecipientIndex]?.ws === ws;
       const timestamp = new Date().toISOString();

@@ -265,10 +265,11 @@ paseo ls --background       # Also include agents in background workspaces
 
 ## Agent notifications
 
-Choose **Mute notifications** from an agent tab's context menu to silence that agent's
-desktop alerts and mobile push notifications. Choose **Unmute notifications** to restore
-them. Muting applies across connected devices and survives daemon restarts; agent activity,
-status, and permission controls remain available in the app.
+Choose **Mute completion alerts** from an agent tab's context menu to silence that agent's
+completion alerts on desktop and mobile. Choose **Unmute completion alerts** to restore
+them. Permission requests and errors keep their normal notification behavior. Muting applies
+across connected devices and survives daemon restarts; agent activity, status, and permission
+controls remain available in the app.
 
 On hosts that support per-agent muting, scripts can set the same preference with a label:
 
